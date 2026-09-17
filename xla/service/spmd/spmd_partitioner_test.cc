@@ -18295,9 +18295,12 @@ ENTRY entry {
   ASSERT_OK_AND_ASSIGN(auto module,
                        PartitionComputation(hlo_string, /*num_devices=*/2));
   VLOG(1) << module->ToString();
-  // Check that unreduced HloSharding is preserved after the pass.
+  // Check that unreduced HloSharding is preserved on the module and cleared on
+  // the parameter instructions after the pass.
   EXPECT_THAT(module->entry_computation()->parameter_instructions(),
-              Each(op::Sharding("{unreduced}")));
+              Each(op::NoSharding()));
+  EXPECT_THAT(module->spmd_parameters_shardings(),
+              Each(*ParseSharding("{unreduced}")));
 }
 
 TEST_P(SpmdPartitioningTest, SubgroupUnreducedParam) {
@@ -18312,10 +18315,13 @@ ENTRY entry {
   ASSERT_OK_AND_ASSIGN(auto module,
                        PartitionComputation(hlo_string, /*num_devices=*/4));
   VLOG(1) << module->ToString();
-  // Check that unreduced HloSharding is preserved after the pass.
-  EXPECT_THAT(
-      module->entry_computation()->parameter_instructions(),
-      Each(op::Sharding("{devices=[1,2,2]<=[4] last_tile_dims={unreduced}}")));
+  // Check that unreduced HloSharding is preserved on the module and cleared on
+  // the parameter instructions after the pass.
+  EXPECT_THAT(module->entry_computation()->parameter_instructions(),
+              Each(op::NoSharding()));
+  EXPECT_THAT(module->spmd_parameters_shardings(),
+              Each(*ParseSharding(
+                  "{devices=[1,2,2]<=[4] last_tile_dims={unreduced}}")));
 }
 
 TEST_P(SpmdPartitioningTest, SubgroupUnreducedDot) {
@@ -19012,9 +19018,12 @@ ENTRY entry {
 })";
   ASSERT_OK_AND_ASSIGN(auto module,
                        PartitionComputation(hlo_string, /*num_devices=*/2));
-  // Check that unreduced HloSharding is preserved after the pass.
-  for (auto* param : module->entry_computation()->parameter_instructions()) {
-    EXPECT_THAT(param->sharding().ToString(), HasSubstr("unreduced"));
+  // Check that unreduced HloSharding is preserved on the module and cleared on
+  // the parameter instructions after the pass.
+  EXPECT_THAT(module->entry_computation()->parameter_instructions(),
+              Each(op::NoSharding()));
+  for (const auto& sharding : module->spmd_parameters_shardings()) {
+    EXPECT_THAT(sharding.ToString(), HasSubstr("unreduced"));
   }
 }
 
@@ -19028,10 +19037,13 @@ ENTRY entry {
 })";
   ASSERT_OK_AND_ASSIGN(auto module,
                        PartitionComputation(hlo_string, /*num_devices=*/4));
-  // Check that unreduced HloSharding is preserved after the pass.
+  // Check that unreduced HloSharding is preserved on the module and cleared on
+  // the parameter instructions after the pass.
+  EXPECT_THAT(module->entry_computation()->parameter_instructions(),
+              Each(op::NoSharding()));
   EXPECT_THAT(
-      module->entry_computation()->parameter_instructions(),
-      Each(op::Sharding("{mesh['x'=2,'y'=2] [{?},{'x'}], unreduced={'y'}}")));
+      module->spmd_parameters_shardings(),
+      Each(*ParseSharding("{mesh['x'=2,'y'=2] [{?},{'x'}], unreduced={'y'}}")));
 }
 
 TEST_F(SpmdPartitioningV3Test, TupleSubgroupUnreducedParamV3) {
@@ -19049,8 +19061,10 @@ ENTRY entry {
   ASSERT_OK_AND_ASSIGN(auto module,
                        PartitionComputation(hlo_string, /*num_devices=*/2));
   EXPECT_THAT(module->entry_computation()->parameter_instructions(),
-              Each(op::Sharding("{{mesh['x'=2] [], unreduced={'x'}}, "
-                                "{mesh['x'=2] [], unreduced={'x'}}}")));
+              Each(op::NoSharding()));
+  EXPECT_THAT(module->spmd_parameters_shardings(),
+              Each(*ParseSharding("{{mesh['x'=2] [], unreduced={'x'}}, "
+                                  "{mesh['x'=2] [], unreduced={'x'}}}")));
 }
 
 TEST_F(SpmdPartitioningV3Test, PatternMatchMergeNamedSharding) {
@@ -19314,10 +19328,13 @@ ENTRY entry {
   ASSERT_OK_AND_ASSIGN(auto module,
                        PartitionComputation(hlo_string, /*num_devices=*/4));
   VLOG(1) << module->ToString();
-  // Check that unreduced HloSharding is preserved after the pass.
+  // Check that unreduced HloSharding is preserved on the module and cleared on
+  // the parameter instructions after the pass.
+  EXPECT_THAT(module->entry_computation()->parameter_instructions(),
+              Each(op::NoSharding()));
   EXPECT_THAT(
-      module->entry_computation()->parameter_instructions(),
-      Each(op::Sharding("{mesh['a'=2,'b'=2], [], unreduced=max{'a','b'}}")));
+      module->spmd_parameters_shardings(),
+      Each(*ParseSharding("{mesh['a'=2,'b'=2], [], unreduced=max{'a','b'}}")));
 }
 
 // Verifies that a true 1D scatter-conflict on a reduction dimension (e.g.,
