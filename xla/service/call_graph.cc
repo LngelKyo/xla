@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "xla/service/call_graph.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <queue>
@@ -29,16 +31,16 @@ limitations under the License.
 #include "absl/memory/memory.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/map_util.h"
-#include "xla/tsl/platform/errors.h"
-#include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
 
 namespace xla {
@@ -110,46 +112,50 @@ CallGraph::CallGraph(
     const absl::flat_hash_set<absl::string_view>& execution_threads)
     : module_(module), execution_threads_(execution_threads) {}
 
+int64_t CallGraph::FindNodeIndex(const HloComputation* computation) const {
+  if (computation == nullptr) {
+    return -1;
+  }
+  const int64_t id = computation->unique_id();
+  if (id >= 0 && id < static_cast<int64_t>(node_indices_by_unique_id_.size())) {
+    const int64_t index = node_indices_by_unique_id_[id];
+    if (index >= 0 && nodes_[index].computation() == computation) {
+      return index;
+    }
+  }
+  auto it = node_indices_.find(computation);
+  return it == node_indices_.end() ? -1 : it->second;
+}
+
 const CallGraphNode& CallGraph::GetNode(
     const HloComputation* computation) const {
-  DCHECK(node_indices_.contains(computation));
-  return nodes_[node_indices_.find(computation)->second];
+  const int64_t index = FindNodeIndex(computation);
+  DCHECK_GE(index, 0) << (computation == nullptr ? "null"
+                                                 : computation->name());
+  return nodes_[index];
 }
 
 CallGraphNode& CallGraph::GetNode(const HloComputation* computation) {
-  DCHECK(node_indices_.contains(computation));
-  return nodes_[node_indices_.find(computation)->second];
-}
-
-bool CallGraph::DominatesHelper(
-    const HloComputation* a, const HloComputation* b,
-    absl::flat_hash_set<const HloComputation*>* visited) const {
-  if (a == b || ContainsKey(*visited, b)) {
-    // The call graph is guaranteed to be acyclic so any previously visited node
-    // we encounter was already determined to be dominated.
-    return true;
-  }
-
-  const CallGraphNode& b_node = GetNode(b);
-  if (b_node.callers().empty()) {
-    // We reached a root node without hitting 'a'. 'a' does not dominate 'b'.
-    return false;
-  }
-
-  // Walk up the callers of 'b' until we hit 'a' or a root node (no callers).
-  visited->insert(b);
-  for (const HloComputation* b_caller : b_node.callers()) {
-    if (!DominatesHelper(a, b_caller, visited)) {
-      return false;
-    }
-  }
-  return true;
+  const int64_t index = FindNodeIndex(computation);
+  DCHECK_GE(index, 0) << (computation == nullptr ? "null"
+                                                 : computation->name());
+  return nodes_[index];
 }
 
 bool CallGraph::Dominates(const HloComputation* a,
                           const HloComputation* b) const {
-  absl::flat_hash_set<const HloComputation*> visited;
-  return DominatesHelper(a, b, &visited);
+  if (a == b) {
+    return true;
+  }
+  const CallGraphNode& b_node = GetNode(b);
+  const int64_t a_index = FindNodeIndex(a);
+  if (a_index < 0) {
+    // No path in the graph passes through a computation outside the graph.
+    return false;
+  }
+  const CallGraphNode& a_node = nodes_[a_index];
+  return a_node.dominator_preorder_ <= b_node.dominator_preorder_ &&
+         b_node.dominator_preorder_ < a_node.dominator_preorder_end_;
 }
 
 bool CallGraph::CanReach(const HloComputation* a,
@@ -173,15 +179,16 @@ namespace {
 CallContext UnionContexts(CallContext a, CallContext b) {
   if (a == CallContext::kNone) {
     return b;
-  } else if (b == CallContext::kNone) {
-    return a;
-  } else if (a == b) {
-    return a;
-  } else {
-    // Contexts are different and neither is kNone, i.e. one is kControlFlow and
-    // the other is kEmbedded.
-    return CallContext::kBoth;
   }
+  if (b == CallContext::kNone) {
+    return a;
+  }
+  if (a == b) {
+    return a;
+  }
+  // Contexts are different and neither is kNone, i.e. one is kControlFlow and
+  // the other is kEmbedded.
+  return CallContext::kBoth;
 }
 
 }  // namespace
@@ -276,6 +283,90 @@ void CallGraph::SetNodeDepths() {
   }
 }
 
+void CallGraph::SetDominatorTree() {
+  // 'a' dominates 'b' iff 'b' is 'a', or 'b' has callers and 'a' dominates
+  // every one of them. So the dominators of 'b' are 'b' plus the common
+  // dominators of its callers, and the immediate dominator of 'b' is the
+  // nearest common dominator of its callers. Root nodes (no callers) hang off
+  // a virtual root, index -1, so that a node called from two roots is
+  // dominated only by itself. The graph is acyclic and depth() is the longest
+  // call chain from a root, so visiting nodes by increasing depth visits
+  // callers before callees.
+  const int64_t num_nodes = nodes_.size();
+  std::vector<int64_t> order(num_nodes);
+  {
+    int max_depth = 0;
+    for (const CallGraphNode& node : nodes_) {
+      max_depth = std::max(max_depth, node.depth());
+    }
+    std::vector<int64_t> depth_slot(max_depth + 2, 0);
+    for (const CallGraphNode& node : nodes_) {
+      ++depth_slot[node.depth() + 1];
+    }
+    for (int depth = 0; depth <= max_depth; ++depth) {
+      depth_slot[depth + 1] += depth_slot[depth];
+    }
+    for (int64_t index = 0; index < num_nodes; ++index) {
+      order[depth_slot[nodes_[index].depth()]++] = index;
+    }
+  }
+  std::vector<int64_t> immediate_dominator(num_nodes, -1);
+  std::vector<int64_t> dominator_depth(num_nodes, 0);
+  auto nearest_common_dominator = [&](int64_t a, int64_t b) {
+    while (a != b) {
+      if (a < 0 || b < 0) {
+        return int64_t{-1};
+      }
+      if (dominator_depth[a] > dominator_depth[b]) {
+        a = immediate_dominator[a];
+      } else if (dominator_depth[b] > dominator_depth[a]) {
+        b = immediate_dominator[b];
+      } else {
+        a = immediate_dominator[a];
+        b = immediate_dominator[b];
+      }
+    }
+    return a;
+  };
+  for (int64_t index : order) {
+    int64_t dominator = -1;
+    bool first_caller = true;
+    for (const HloComputation* caller : nodes_[index].callers()) {
+      const int64_t caller_index = FindNodeIndex(caller);
+      DCHECK_GE(caller_index, 0);
+      dominator = first_caller
+                      ? caller_index
+                      : nearest_common_dominator(dominator, caller_index);
+      first_caller = false;
+    }
+    immediate_dominator[index] = dominator;
+    dominator_depth[index] =
+        (dominator < 0 ? 0 : dominator_depth[dominator]) + 1;
+  }
+
+  // Number the nodes in a preorder of the dominator tree: a node's interval
+  // spans its subtree and begins one past its parent's entry, after the
+  // subtrees of its earlier siblings. A dominator is a call graph ancestor, so
+  // the depth order visits parents before children, and its reverse visits
+  // children before parents.
+  std::vector<int64_t> subtree_size(num_nodes, 1);
+  for (auto it = order.rbegin(); it != order.rend(); ++it) {
+    if (immediate_dominator[*it] >= 0) {
+      subtree_size[immediate_dominator[*it]] += subtree_size[*it];
+    }
+  }
+  // next_child_entry[p + 1] is the entry of the next child of parent p, with
+  // p = -1 for the virtual root.
+  std::vector<int64_t> next_child_entry(num_nodes + 1, 0);
+  for (int64_t index : order) {
+    int64_t& next_entry = next_child_entry[immediate_dominator[index] + 1];
+    nodes_[index].dominator_preorder_ = next_entry;
+    nodes_[index].dominator_preorder_end_ = next_entry + subtree_size[index];
+    next_child_entry[index + 1] = next_entry + 1;
+    next_entry += subtree_size[index];
+  }
+}
+
 /* static */
 std::unique_ptr<CallGraph> CallGraph::Build(
     const HloModule* module,
@@ -303,6 +394,25 @@ std::unique_ptr<CallGraph> CallGraph::Build(
     }
   }
 
+  // Index the nodes by computation unique id when the ids are dense. A module
+  // assigns them from a counter, so they are; ids kept from a proto need not
+  // be, and then the hash map alone serves the lookups.
+  int64_t max_unique_id = -1;
+  for (const CallGraphNode& node : call_graph->nodes_) {
+    max_unique_id = std::max(max_unique_id, node.computation()->unique_id());
+  }
+  const int64_t num_nodes = call_graph->nodes_.size();
+  if (max_unique_id < 16 * num_nodes + 1024) {
+    call_graph->node_indices_by_unique_id_.assign(max_unique_id + 1, -1);
+    for (int64_t index = 0; index < num_nodes; ++index) {
+      const int64_t id = call_graph->nodes_[index].computation()->unique_id();
+      if (id >= 0) {
+        call_graph->node_indices_by_unique_id_[id] =
+            static_cast<int32_t>(index);
+      }
+    }
+  }
+
   // Add caller callsites to each node.
   for (const HloComputation* computation :
        module->computations(execution_threads)) {
@@ -318,9 +428,17 @@ std::unique_ptr<CallGraph> CallGraph::Build(
       }
     }
   }
+  for (CallGraphNode& node : call_graph->nodes_) {
+    if (!node.caller_callsites().empty()) {
+      node.first_caller_node_ = call_graph->FindNodeIndex(
+          node.caller_callsites()[0].instruction()->parent());
+      DCHECK_GE(node.first_caller_node_, 0);
+    }
+  }
 
   call_graph->SetCallContexts();
   call_graph->SetNodeDepths();
+  call_graph->SetDominatorTree();
 
   XLA_VLOG_LINES(2, call_graph->ToString());
 
@@ -463,55 +581,70 @@ std::vector<HloInstruction*> CallGraph::GetComputationCallers(
 std::pair<HloInstruction*, HloInstruction*>
 CallGraph::NearestAncestorsInSameComputation(HloInstruction* a,
                                              HloInstruction* b) const {
-  // Lambda which returns the next instruction in the callee->caller chain in
-  // the call graph. This is the unique instruction which calls the computation
-  // containing 'instruction'. If more than one instruction calls the
-  // computation containing 'instruction' or no instructions call the
-  // computation then nullptr is returned.
-  auto next_caller = [this](HloInstruction* instruction) -> HloInstruction* {
-    const CallGraphNode& node = GetNode(instruction->parent());
-    if (node.caller_callsites().size() != 1) {
-      if (instruction->parent()->IsAsyncComputation()) {
-        return node.caller_callsites()[0].instruction();
-      }
-      return nullptr;
+  if (a->parent() == b->parent()) {
+    return {a, b};
+  }
+
+  // An ancestor in the callee->caller chain of 'a' or 'b', together with the
+  // call graph node of its computation.
+  struct Ancestor {
+    HloInstruction* instruction;
+    int64_t node;
+  };
+  // Replaces 'ancestor' with the next instruction in its callee->caller chain.
+  // This is the unique instruction which calls the computation containing the
+  // ancestor. If more than one instruction calls that computation or no
+  // instructions call it then the chain ends and the ancestor becomes nullptr.
+  // An async computation may be called by several async instructions; its
+  // chain continues at the first of them.
+  auto next_caller = [this](Ancestor& ancestor) {
+    const CallGraphNode& node = nodes_[ancestor.node];
+    absl::Span<const CallSite> caller_callsites = node.caller_callsites();
+    if (caller_callsites.empty() ||
+        (caller_callsites.size() > 1 &&
+         !node.computation()->IsAsyncComputation())) {
+      ancestor.instruction = nullptr;
+      return;
     }
-    return node.caller_callsites()[0].instruction();
+    ancestor.instruction = caller_callsites[0].instruction();
+    ancestor.node = node.first_caller_node_;
   };
 
   // Iterate through the callee->caller chains and find the earliest common
   // element.
-  HloInstruction* a_ancestor = a;
-  HloInstruction* b_ancestor = b;
-  int a_depth = GetNode(a->parent()).depth();
-  int b_depth = GetNode(b->parent()).depth();
+  Ancestor a_ancestor{a, FindNodeIndex(a->parent())};
+  Ancestor b_ancestor{b, FindNodeIndex(b->parent())};
+  DCHECK_GE(a_ancestor.node, 0);
+  DCHECK_GE(b_ancestor.node, 0);
+  const int a_depth = nodes_[a_ancestor.node].depth();
+  const int b_depth = nodes_[b_ancestor.node].depth();
 
   // Advance a_ancestor (b_ancestor) up the call chain until the call depth of
   // a_ancestor or b_ancestor are the same. Necessarily each call to next_caller
   // reduces the depth by exactly one.
   if (a_depth > b_depth) {
     for (int i = 0; i < a_depth - b_depth; ++i) {
-      a_ancestor = next_caller(a_ancestor);
-      if (a_ancestor == nullptr) {
+      next_caller(a_ancestor);
+      if (a_ancestor.instruction == nullptr) {
         return {nullptr, nullptr};
       }
     }
   } else if (b_depth > a_depth) {
     for (int i = 0; i < b_depth - a_depth; ++i) {
-      b_ancestor = next_caller(b_ancestor);
-      if (b_ancestor == nullptr) {
+      next_caller(b_ancestor);
+      if (b_ancestor.instruction == nullptr) {
         return {nullptr, nullptr};
       }
     }
   }
 
-  while ((a_ancestor != nullptr) && (b_ancestor != nullptr)) {
-    if (a_ancestor->parent() == b_ancestor->parent()) {
-      return {a_ancestor, b_ancestor};
+  while (a_ancestor.instruction != nullptr &&
+         b_ancestor.instruction != nullptr) {
+    if (a_ancestor.node == b_ancestor.node) {
+      return {a_ancestor.instruction, b_ancestor.instruction};
     }
-
-    a_ancestor = next_caller(a_ancestor);
-    b_ancestor = next_caller(b_ancestor);
+    next_caller(a_ancestor);
+    next_caller(b_ancestor);
   }
   return {nullptr, nullptr};
 }

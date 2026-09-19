@@ -21,6 +21,7 @@ limitations under the License.
 #include <cstdint>
 #include <iterator>
 #include <memory>
+#include <random>
 #include <string>
 #include <utility>
 #include <vector>
@@ -28,6 +29,8 @@ limitations under the License.
 #include "absl/algorithm/container.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
+#include "absl/types/span.h"
 #include "tsl/platform/errors.h"
 #include "xla/comparison_util.h"
 #include "xla/hlo/ir/hlo_computation.h"
@@ -527,6 +530,218 @@ TEST_F(CallGraphTest, ComplexGraphNearestAncestors) {
             std::make_pair(a_while, a_call));
   EXPECT_EQ(call_graph->NearestAncestorsInSameComputation(a_while, b_map),
             std::make_pair(a_while, a_while));
+}
+
+TEST_F(CallGraphTest, NearestAncestorsThroughAsyncComputation) {
+  // The callee to caller chain of an async computation with several callers
+  // continues at the first of them.
+  constexpr absl::string_view kHloString = R"(
+    HloModule test_module
+
+    %inner (p: f32[]) -> f32[] {
+      %p = f32[] parameter(0)
+      ROOT %negate = f32[] negate(f32[] %p)
+    }, execution_thread="worker"
+
+    %async_wrapped (param: f32[]) -> f32[] {
+      %param = f32[] parameter(0)
+      ROOT %call = f32[] call(f32[] %param), to_apply=%inner
+    }, execution_thread="worker"
+
+    ENTRY %entry (x: f32[], y: f32[]) -> (f32[], f32[]) {
+      %x = f32[] parameter(0)
+      %y = f32[] parameter(1)
+      %async-start = ((f32[]), f32[], u32[]) async-start(f32[] %x), async_execution_thread="worker", calls=%async_wrapped
+      %async-done = f32[] async-done(((f32[]), f32[], u32[]) %async-start)
+      %async-start.1 = ((f32[]), f32[], u32[]) async-start(f32[] %y), async_execution_thread="worker", calls=%async_wrapped
+      %async-done.1 = f32[] async-done(((f32[]), f32[], u32[]) %async-start.1)
+      ROOT %tuple = (f32[], f32[]) tuple(f32[] %async-done, f32[] %async-done.1)
+    }
+  )";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(kHloString));
+  HloInstruction* negate = FindInstruction(module.get(), "negate");
+  HloInstruction* param = FindInstruction(module.get(), "param");
+  HloInstruction* call = FindInstruction(module.get(), "call");
+  HloInstruction* x = FindInstruction(module.get(), "x");
+  HloInstruction* async_start = FindInstruction(module.get(), "async-start");
+  HloInstruction* async_done = FindInstruction(module.get(), "async-done");
+
+  std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module.get());
+  ASSERT_EQ(call_graph->GetNode(async_start->async_wrapped_computation())
+                .caller_callsites()
+                .size(),
+            2);
+  EXPECT_EQ(call_graph->NearestAncestorsInSameComputation(negate, x),
+            std::make_pair(async_start, x));
+  EXPECT_EQ(call_graph->NearestAncestorsInSameComputation(x, negate),
+            std::make_pair(x, async_start));
+  EXPECT_EQ(call_graph->NearestAncestorsInSameComputation(negate, param),
+            std::make_pair(call, param));
+  EXPECT_EQ(call_graph->NearestAncestorsInSameComputation(x, async_done),
+            std::make_pair(x, async_done));
+
+  // Without the entry, the async computation has no caller in the graph and
+  // the chain ends there (it used to index an empty caller list).
+  std::unique_ptr<CallGraph> worker_graph =
+      CallGraph::Build(module.get(), {"worker"});
+  EXPECT_EQ(worker_graph->nodes().size(), 2);
+  EXPECT_EQ(worker_graph->NearestAncestorsInSameComputation(negate, param),
+            std::make_pair(call, param));
+  EXPECT_EQ(worker_graph->NearestAncestorsInSameComputation(negate, call),
+            std::make_pair(call, call));
+
+  // Instructions of two roots of the graph have no common ancestor.
+  HloComputation* other =
+      module->AddEmbeddedComputation(MakeScalarComputation(HloOpcode::kExp));
+  other->SetExecutionThread("worker");
+  std::unique_ptr<CallGraph> two_roots_graph =
+      CallGraph::Build(module.get(), {"worker"});
+  EXPECT_EQ(two_roots_graph->nodes().size(), 3);
+  std::pair<HloInstruction*, HloInstruction*> null_pair = {nullptr, nullptr};
+  EXPECT_EQ(two_roots_graph->NearestAncestorsInSameComputation(
+                negate, other->root_instruction()),
+            null_pair);
+}
+
+TEST_F(CallGraphTest, DominatesDiamondAndSecondRoot) {
+  // Dominance on a diamond, then with a second root reaching the join:
+  //
+  //     entry            entry   dead
+  //     /   \            /   \    /
+  //    a     b          a     b  /
+  //     \   /            \   /  /
+  //       c                 c
+  auto module = CreateNewVerifiedModule();
+  HloComputation* c_computation =
+      module->AddEmbeddedComputation(MakeScalarComputation());
+  HloComputation* a_computation = module->AddEmbeddedComputation(
+      MakeCallingComputation(c_computation, /*callsites=*/1, ".a"));
+  HloComputation* b_computation = module->AddEmbeddedComputation(
+      MakeCallingComputation(c_computation, /*callsites=*/1, ".b"));
+  HloComputation* entry_computation;
+  {
+    HloComputation::Builder builder(TestName() + ".entry");
+    HloInstruction* param0 = builder.AddInstruction(
+        HloInstruction::CreateParameter(0, kScalarShape, "param0"));
+    HloInstruction* call_a = builder.AddInstruction(
+        HloInstruction::CreateCall(kScalarShape, {param0}, a_computation));
+    builder.AddInstruction(
+        HloInstruction::CreateCall(kScalarShape, {call_a}, b_computation));
+    entry_computation = module->AddEntryComputation(builder.Build());
+  }
+  {
+    std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module.get());
+    EXPECT_TRUE(call_graph->Dominates(entry_computation, c_computation));
+    EXPECT_FALSE(call_graph->Dominates(a_computation, c_computation));
+    EXPECT_FALSE(call_graph->Dominates(b_computation, c_computation));
+    EXPECT_TRUE(call_graph->Dominates(c_computation, c_computation));
+    EXPECT_FALSE(call_graph->Dominates(c_computation, entry_computation));
+  }
+
+  // A second root reaching 'c' leaves 'c' dominated by nothing but itself.
+  HloComputation* dead_computation = module->AddEmbeddedComputation(
+      MakeCallingComputation(c_computation, /*callsites=*/1, ".dead"));
+  std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module.get());
+  EXPECT_FALSE(call_graph->Dominates(entry_computation, c_computation));
+  EXPECT_FALSE(call_graph->Dominates(dead_computation, c_computation));
+  EXPECT_TRUE(call_graph->Dominates(c_computation, c_computation));
+  EXPECT_TRUE(call_graph->Dominates(entry_computation, a_computation));
+  EXPECT_TRUE(call_graph->Dominates(entry_computation, b_computation));
+  EXPECT_TRUE(call_graph->Dominates(dead_computation, dead_computation));
+}
+
+TEST_F(CallGraphTest, DominatesComputationOutsideGraph) {
+  // A computation that is not in the call graph dominates nothing but itself,
+  // whether its unique id lies beyond the graph's computations or collides
+  // with the id of one of them.
+  auto module = CreateNewVerifiedModule();
+  HloComputation* callee_computation =
+      module->AddEmbeddedComputation(MakeScalarComputation());
+  HloComputation* entry_computation = module->AddEntryComputation(
+      MakeCallingComputation(callee_computation, /*callsites=*/1));
+  std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module.get());
+
+  HloComputation* late_computation =
+      module->AddEmbeddedComputation(MakeScalarComputation());
+  auto other_module = CreateNewVerifiedModule();
+  HloComputation* other_computation =
+      other_module->AddEntryComputation(MakeScalarComputation());
+  ASSERT_EQ(other_computation->unique_id(), callee_computation->unique_id());
+
+  EXPECT_TRUE(call_graph->Dominates(entry_computation, callee_computation));
+  EXPECT_FALSE(call_graph->Dominates(late_computation, callee_computation));
+  EXPECT_FALSE(call_graph->Dominates(other_computation, callee_computation));
+  EXPECT_FALSE(call_graph->Dominates(late_computation, entry_computation));
+  EXPECT_TRUE(call_graph->Dominates(late_computation, late_computation));
+  EXPECT_TRUE(call_graph->Dominates(other_computation, other_computation));
+}
+
+// The definition of dominance: a computation dominates itself, and dominates a
+// computation with callers iff it dominates every caller.
+bool DominatesByCallerWalk(const CallGraph& call_graph, const HloComputation* a,
+                           const HloComputation* b) {
+  if (a == b) {
+    return true;
+  }
+  absl::Span<HloComputation* const> callers = call_graph.GetNode(b).callers();
+  if (callers.empty()) {
+    return false;
+  }
+  return absl::c_all_of(callers, [&](const HloComputation* caller) {
+    return DominatesByCallerWalk(call_graph, a, caller);
+  });
+}
+
+TEST_F(CallGraphTest, DominatesMatchesCallerWalkOnRandomGraphs) {
+  // Random acyclic call graphs with shared callees and several roots. Each
+  // computation calls a random subset of the computations created before it,
+  // and the last one is the entry.
+  std::mt19937 rng(42);
+  int graphs_with_several_roots = 0;
+  int graphs_with_shared_callee = 0;
+  for (int trial = 0; trial < 50; ++trial) {
+    auto module = CreateNewVerifiedModule();
+    std::vector<HloComputation*> computations;
+    const int num_computations = 2 + static_cast<int>(rng() % 12);
+    for (int i = 0; i < num_computations; ++i) {
+      HloComputation::Builder builder(absl::StrCat(TestName(), ".c", i));
+      HloInstruction* value = builder.AddInstruction(
+          HloInstruction::CreateParameter(0, kScalarShape, "param0"));
+      for (HloComputation* callee : computations) {
+        if (rng() % 3 == 0) {
+          value = builder.AddInstruction(
+              HloInstruction::CreateCall(kScalarShape, {value}, callee));
+        }
+      }
+      builder.AddInstruction(
+          HloInstruction::CreateUnary(kScalarShape, HloOpcode::kNegate, value));
+      computations.push_back(
+          i + 1 == num_computations
+              ? module->AddEntryComputation(builder.Build())
+              : module->AddEmbeddedComputation(builder.Build()));
+    }
+    std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module.get());
+    int roots = 0;
+    bool shared_callee = false;
+    for (const CallGraphNode& node : call_graph->nodes()) {
+      roots += node.callers().empty() ? 1 : 0;
+      shared_callee |= node.callers().size() > 1;
+    }
+    graphs_with_several_roots += roots > 1 ? 1 : 0;
+    graphs_with_shared_callee += shared_callee ? 1 : 0;
+    for (const HloComputation* a : computations) {
+      for (const HloComputation* b : computations) {
+        EXPECT_EQ(call_graph->Dominates(a, b),
+                  DominatesByCallerWalk(*call_graph, a, b))
+            << "trial " << trial << ": " << a->name() << " vs " << b->name()
+            << "\n"
+            << call_graph->ToString();
+      }
+    }
+  }
+  EXPECT_GT(graphs_with_several_roots, 0);
+  EXPECT_GT(graphs_with_shared_callee, 0);
 }
 
 TEST_F(CallGraphTest, NearestCommonAncestorInstructions) {
