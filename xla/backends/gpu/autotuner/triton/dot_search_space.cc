@@ -244,9 +244,36 @@ bool TritonDotFusionSearchSpace::HasExpensiveTransitiveParent(
 
 int TritonDotFusionSearchSpace::GetDesiredTotalWarps() const {
   constexpr int kSchedulersPerCore = 4;
-  constexpr int kDesiredWarpsPerCore =
-      kMaxWarpsPerScheduler * kSchedulersPerCore;
-  return kDesiredWarpsPerCore * device_description_.core_count();
+  // Estimate the arithmetic intensity (FLOPs / byte) of the dot.
+  // Each multiply-accumulate is 2 FLOPs.
+  const double m = static_cast<double>(lhs_parallel_size_);
+  const double n = static_cast<double>(rhs_parallel_size_);
+  const double k = static_cast<double>(contracting_size_);
+  const double flops = 2.0 * m * n * k;
+  const double lhs_bytes = m * k * (operand_bitwidth_ / 8.0);
+  const double rhs_bytes = k * n * (operand_bitwidth_ / 8.0);
+  const double out_bytes = m * n * (compute_bitwidth_ / 8.0);
+  const double total_bytes = lhs_bytes + rhs_bytes + out_bytes;
+  const double arithmetic_intensity =
+      total_bytes > 0 ? flops / total_bytes : 0.0;
+
+  // Approximate ridge-point arithmetic intensity (FLOPs / byte) where the dot
+  // transitions from memory-bound to compute-bound (~300 FLOP/B for 16-bit
+  // Tensor Cores on Hopper/Blackwell, scaling inversely with operand bitwidth).
+  const double ridge_point = 4800.0 / operand_bitwidth_;
+  const double compute_intensity_ratio =
+      std::clamp(arithmetic_intensity / ridge_point, 0.0, 1.0);
+
+  // Memory-bound dots benefit from higher warp oversubscription (up to
+  // kMaxWarpsPerScheduler) to overlap memory latency, while compute-bound dots
+  // scale down to kMinWarpsPerScheduler to avoid thrashing and contention.
+  const int desired_warps_per_scheduler = static_cast<int>(
+      std::round(kMaxWarpsPerScheduler -
+                 compute_intensity_ratio *
+                     (kMaxWarpsPerScheduler - kMinWarpsPerScheduler)));
+  const int desired_warps_per_core =
+      desired_warps_per_scheduler * kSchedulersPerCore;
+  return desired_warps_per_core * device_description_.core_count();
 }
 
 TritonDotFusionSearchSpace::OutputTile
@@ -593,7 +620,9 @@ void TritonDotFusionSearchSpace::EliminateLowOccupancyConfigs(
     return;
   }
 
-  constexpr int kMinConfigsForOccupancyOptimization = 24;
+  // Output tilings alone typically produce 12-20 configs (without split-K
+  // multipliers). We only skip optimization for very small search spaces.
+  constexpr int kMinConfigsForOccupancyOptimization = 15;
   if (configs.size() < kMinConfigsForOccupancyOptimization) {
     VLOG(10) << "Skipping occupancy optimization for small search spaces. "
                 "Configs size: "
@@ -601,7 +630,7 @@ void TritonDotFusionSearchSpace::EliminateLowOccupancyConfigs(
     return;
   }
 
-  ConfigWithNotes last_config = configs.back();  // Largest split.
+  ConfigWithNotes last_config = configs.back();
   auto has_too_few_tiles = [](const ConfigWithNotes& config) {
     if (config.not_enough_tiles) {
       VLOG(10) << "Skipping due to fewer tiles than cores, config = "
@@ -613,8 +642,7 @@ void TritonDotFusionSearchSpace::EliminateLowOccupancyConfigs(
   configs.erase(llvm::remove_if(configs, has_too_few_tiles), configs.end());
   if (configs.empty()) {
     // We can get no configs if the problem is small enough to not even occupy
-    // all cores. In that case, we just use the largest split and smallest
-    // tiling.
+    // all cores. In that case, we just use the smallest tiling.
     last_config.config.block_m = min_out_tile_.lhs_dim;
     last_config.config.block_n = min_out_tile_.rhs_dim;
     VLOG(10) << "No configs with sufficient occupancy, using config = "
