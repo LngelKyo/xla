@@ -57,12 +57,25 @@ absl::StatusOr<std::unique_ptr<HloLiveRange>> HloLiveRange::Run(
     const HloComputation* computation, bool module_scoped_analysis,
     absl::flat_hash_set<absl::string_view> execution_threads) {
   std::unique_ptr<HloLiveRange> hlo_live_range(
-      new HloLiveRange(schedule, alias_analysis, module_scoped_analysis,
+      new HloLiveRange(schedule, &alias_analysis, module_scoped_analysis,
                        std::move(execution_threads)));
   ABSL_RETURN_IF_ERROR(hlo_live_range->FlattenSchedule(*computation));
   hlo_live_range->CalculateBufferStartEndMap();
   hlo_live_range->NormalizeAliasedBuffers();
   return hlo_live_range;
+}
+
+/*static*/
+absl::StatusOr<HloInstructionSequence>
+HloLiveRange::GetFlattenedInstructionSequence(
+    const HloSchedule& schedule, const HloComputation* computation,
+    bool module_scoped_analysis,
+    absl::flat_hash_set<absl::string_view> execution_threads) {
+  HloLiveRange hlo_live_range(schedule, /*alias_analysis=*/nullptr,
+                              module_scoped_analysis,
+                              std::move(execution_threads));
+  ABSL_RETURN_IF_ERROR(hlo_live_range.FlattenSchedule(*computation));
+  return std::move(hlo_live_range.flattened_instruction_sequence_);
 }
 
 /*static*/
@@ -184,7 +197,7 @@ void HloLiveRange::NormalizeAliasedBuffers() {
       live_ranges_by_buffer;
   for (auto& entry : buffer_live_ranges_) {
     const HloValue& value = *entry.first;
-    const HloBuffer& buffer = alias_analysis_.GetBufferContainingValue(value);
+    const HloBuffer& buffer = alias_analysis_->GetBufferContainingValue(value);
     live_ranges_by_buffer[buffer.id()].push_back({&entry.second, value.id()});
   }
 
@@ -405,7 +418,7 @@ void HloLiveRange::CalculateBufferStartEndMap() {
     }
 
     for (const HloValue* value :
-         GetValuesDefined(&instruction, alias_analysis_.dataflow_analysis())) {
+         GetValuesDefined(&instruction, alias_analysis_->dataflow_analysis())) {
       auto [end_time, end_position] =
           ComputeValueLiveRangeEnd(*value, definition_end_time);
       LiveRangeBounds live_range{start_time, end_time, end_position};
@@ -431,7 +444,7 @@ void HloLiveRange::CalculateBufferStartEndMap() {
 int64_t HloLiveRange::ComputePeakMemoryMoment() const {
   std::vector<std::tuple<int64_t /*time*/, bool /*is_end*/, const HloValue*>>
       events;
-  for (const HloValue* value : alias_analysis_.dataflow_analysis().values()) {
+  for (const HloValue* value : alias_analysis_->dataflow_analysis().values()) {
     auto it = buffer_live_ranges_.find(value);
     if (it != buffer_live_ranges_.end()) {
       events.emplace_back(it->second.start, false, value);
@@ -478,7 +491,7 @@ std::string HloLiveRange::ToString() const {
 
   absl::StrAppendFormat(&output, "  BufferLiveRange:\n");
 
-  for (const HloValue* value : alias_analysis_.dataflow_analysis().values()) {
+  for (const HloValue* value : alias_analysis_->dataflow_analysis().values()) {
     auto it = buffer_live_ranges_.find(value);
     if (it != buffer_live_ranges_.end()) {
       absl::StrAppendFormat(
@@ -500,7 +513,7 @@ std::string HloLiveRange::ToString() const {
                         peak_moment);
 
   std::vector<std::pair<int64_t, const HloValue*>> sized_buffers;
-  for (const HloValue* value : alias_analysis_.dataflow_analysis().values()) {
+  for (const HloValue* value : alias_analysis_->dataflow_analysis().values()) {
     auto it = buffer_live_ranges_.find(value);
     if (it != buffer_live_ranges_.end()) {
       if (it->second.start <= peak_moment && peak_moment <= it->second.end) {

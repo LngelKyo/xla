@@ -1203,5 +1203,108 @@ ENTRY entry {
   EXPECT_FALSE(root_buffers.empty());
   EXPECT_TRUE(HloLiveRange::BufferLivesOut(*root_buffers[0], *aa, entry));
 }
+
+TEST_F(HloLiveRangeTest, GetFlattenedInstructionSequenceMatchesRun) {
+  const char* hlo_string = R"(
+HloModule module, is_scheduled=true
+
+%body (body_param: (f32[4], s32[])) -> (f32[4], s32[]) {
+  %body_param = (f32[4], s32[]) parameter(0)
+  %body_data = f32[4] get-tuple-element(%body_param), index=0
+  %body_iter = s32[] get-tuple-element(%body_param), index=1
+  %one = s32[] constant(1)
+  %body_iter_next = s32[] add(%body_iter, %one)
+  %body_data_next = f32[4] negate(%body_data)
+  ROOT %body_out = (f32[4], s32[]) tuple(%body_data_next, %body_iter_next)
+}
+
+%cond (cond_param: (f32[4], s32[])) -> pred[] {
+  %cond_param = (f32[4], s32[]) parameter(0)
+  %cond_iter = s32[] get-tuple-element(%cond_param), index=1
+  %limit = s32[] constant(10)
+  ROOT %cond_lt = pred[] compare(%cond_iter, %limit), direction=LT
+}
+
+%true_branch (true_param: f32[4]) -> f32[4] {
+  %true_param = f32[4] parameter(0)
+  ROOT %true_neg = f32[4] negate(%true_param)
+}
+
+%false_branch (false_param: f32[4]) -> f32[4] {
+  %false_param = f32[4] parameter(0)
+  ROOT %false_exp = f32[4] exponential(%false_param)
+}
+
+%callee (callee_param: f32[4]) -> f32[4] {
+  %callee_param = f32[4] parameter(0)
+  ROOT %callee_add = f32[4] add(%callee_param, %callee_param)
+}
+
+%async_wrapped (async_param: f32[4]) -> f32[4] {
+  %async_param = f32[4] parameter(0)
+  ROOT %async_neg = f32[4] negate(%async_param)
+}
+
+ENTRY %entry (p0: f32[4], p1: pred[]) -> f32[4] {
+  %p0 = f32[4] parameter(0)
+  %p1 = pred[] parameter(1)
+  %zero = s32[] constant(0)
+  %init = (f32[4], s32[]) tuple(%p0, %zero)
+  %while = (f32[4], s32[]) while(%init), condition=%cond, body=%body
+  %while_data = f32[4] get-tuple-element(%while), index=0
+  %conditional = f32[4] conditional(%p1, %while_data, %while_data), true_computation=%true_branch, false_computation=%false_branch
+  %call = f32[4] call(%conditional), to_apply=%callee
+  %async-start = ((f32[4]), f32[4], u32[]) async-start(%call), calls=%async_wrapped
+  %async-done = f32[4] async-done(%async-start)
+  ROOT %root = f32[4] add(%async-done, %call)
+}
+)";
+
+  ASSERT_OK_AND_ASSIGN(module_, ParseAndReturnVerifiedModule(hlo_string));
+  const HloSchedule& schedule = module_->schedule();
+  const HloComputation* entry = module_->entry_computation();
+  ASSERT_OK_AND_ASSIGN(alias_analysis_,
+                       HloAliasAnalysis::Run(module_.get(), &alias_info_));
+  auto names = [](const HloInstructionSequence& sequence) {
+    std::vector<std::string> result;
+    for (const HloInstruction* instruction : sequence.instructions()) {
+      result.push_back(std::string(instruction->name()));
+    }
+    return result;
+  };
+
+  // Module scoped: called computations are inlined before their caller, the
+  // while condition before the body.
+  ASSERT_OK_AND_ASSIGN(HloInstructionSequence module_scoped,
+                       HloLiveRange::GetFlattenedInstructionSequence(
+                           schedule, entry, /*module_scoped_analysis=*/true));
+  EXPECT_THAT(
+      names(module_scoped),
+      ::testing::ElementsAre(
+          "p0", "p1", "zero", "init", "cond_param", "cond_iter", "limit",
+          "cond_lt", "body_param", "body_data", "body_iter", "one",
+          "body_iter_next", "body_data_next", "body_out", "while", "while_data",
+          "true_param", "true_neg", "false_param", "false_exp", "conditional",
+          "callee_param", "callee_add", "call", "async_param", "async_neg",
+          "async-start", "async-done", "root"));
+  ASSERT_OK_AND_ASSIGN(hlo_live_range_,
+                       HloLiveRange::Run(schedule, *alias_analysis_, entry,
+                                         /*module_scoped_analysis=*/true));
+  EXPECT_EQ(module_scoped.instructions(),
+            hlo_live_range_->flattened_instruction_sequence().instructions());
+
+  // Computation scoped: only the entry computation's own sequence.
+  ASSERT_OK_AND_ASSIGN(HloInstructionSequence computation_scoped,
+                       HloLiveRange::GetFlattenedInstructionSequence(
+                           schedule, entry, /*module_scoped_analysis=*/false));
+  EXPECT_EQ(computation_scoped.instructions(),
+            schedule.sequence(entry).instructions());
+  ASSERT_OK_AND_ASSIGN(hlo_live_range_,
+                       HloLiveRange::Run(schedule, *alias_analysis_, entry,
+                                         /*module_scoped_analysis=*/false));
+  EXPECT_EQ(computation_scoped.instructions(),
+            hlo_live_range_->flattened_instruction_sequence().instructions());
+}
+
 }  // namespace
 }  // namespace xla

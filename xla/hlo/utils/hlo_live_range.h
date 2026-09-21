@@ -50,6 +50,15 @@ class HloLiveRange {
       const HloComputation* computation, bool module_scoped_analysis = true,
       absl::flat_hash_set<absl::string_view> execution_threads = {});
 
+  // Returns the flattened_instruction_sequence() that Run() with the same
+  // arguments computes, without needing an alias analysis: the instructions of
+  // `computation` in schedule order and, in module scoped mode, the sequences
+  // of the computations they call inlined before the calling instruction.
+  static absl::StatusOr<HloInstructionSequence> GetFlattenedInstructionSequence(
+      const HloSchedule& schedule, const HloComputation* computation,
+      bool module_scoped_analysis = true,
+      absl::flat_hash_set<absl::string_view> execution_threads = {});
+
   // Returns all HloValues defined by this instruction.
   static std::vector<const HloValue*> GetValuesDefined(
       const HloInstruction* instruction, const HloDataflowAnalysis& dataflow);
@@ -150,8 +159,11 @@ class HloLiveRange {
   bool total_order_scheduled() const { return total_order_scheduled_; }
 
  private:
+  // `alias_analysis` is null only for the object
+  // GetFlattenedInstructionSequence flattens the schedule with; every other
+  // member requires it.
   explicit HloLiveRange(
-      const HloSchedule& schedule, const HloAliasAnalysis& alias_analysis,
+      const HloSchedule& schedule, const HloAliasAnalysis* alias_analysis,
       bool module_scoped_analysis,
       absl::flat_hash_set<absl::string_view> execution_threads = {})
       : schedule_(schedule),
@@ -166,7 +178,7 @@ class HloLiveRange {
   // 'flattened_instruction_sequence`. async_context contains the asynchronous
   // computation that this computation is in, if any. When this value is
   // non-null, it means that this computation is called by an async op or
-  // another op in an asynchronous context.
+  // another op in an asynchronous context. Does not read the alias analysis.
   absl::Status FlattenSchedule(const HloComputation& computation,
                                const HloComputation* async_context = nullptr);
 
@@ -264,7 +276,7 @@ class HloLiveRange {
   LogicalTime ComputePeakMemoryMoment() const;
 
   const HloSchedule& schedule_;
-  const HloAliasAnalysis& alias_analysis_;
+  const HloAliasAnalysis* alias_analysis_;
   bool module_scoped_analysis_;
   bool total_order_scheduled_ = true;
 
