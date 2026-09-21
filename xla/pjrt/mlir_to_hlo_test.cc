@@ -18,6 +18,7 @@ limitations under the License.
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <string>
 
 #include "absl/status/status.h"
@@ -28,6 +29,7 @@ limitations under the License.
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "riegeli/bytes/string_writer.h"
+#include "riegeli/bytes/writer.h"
 #include "stablehlo/api/PortableApi.h"
 #include "xla/hlo/testlib/test.h"
 #include "xla/tsl/platform/statusor.h"
@@ -35,8 +37,10 @@ limitations under the License.
 namespace xla {
 namespace {
 
+using ::absl_testing::IsOk;
 using ::absl_testing::StatusIs;
 using ::testing::HasSubstr;
+using ::testing::Not;
 
 // Portable artifacts are serialized using `serializePortableArtifact` will have
 // a version tag with the target version, i.e. StableHLO_v1.0.0.
@@ -283,6 +287,39 @@ TEST(MlirToHloTest, SerializeToRiegeliTest) {
                                /*allow_mixed_serialization=*/true, &writer));
   EXPECT_TRUE(writer.Close());
   EXPECT_THAT(buffer, IsVhloArtifact("1.0.0"));
+}
+
+class FailingWriter : public riegeli::Writer {
+ public:
+  FailingWriter() {
+    Fail(absl::FailedPreconditionError("We were always going to fail."));
+  }
+
+ protected:
+  bool PushSlow(size_t, size_t) override {
+    // Already failed.
+    return false;
+  }
+};
+
+TEST(MlirToHloTest, SerializeToRiegeliReportsIOErrors) {
+  constexpr absl::string_view kProgram =
+      R"(
+    func.func @add(%arg0: tensor<1x2xf32>) -> tensor<1x2xf32> {
+      %cst = stablehlo.constant dense<1.0> : tensor<1x2xf32>
+      %0 = stablehlo.add %arg0, %cst : tensor<1x2xf32>
+      return %0 : tensor<1x2xf32>
+    }
+  )";
+  mlir::MLIRContext context;
+  ASSERT_OK_AND_ASSIGN(mlir::OwningOpRef<mlir::ModuleOp> module,
+                       ParseMlirModuleString(kProgram, context));
+
+  FailingWriter writer;
+  EXPECT_THAT(SerializeToRiegeli(*module, /*requested_target=*/"1.0.0",
+                                 /*sdy_version=*/"0.0.1", /*inplace=*/false,
+                                 /*allow_mixed_serialization=*/true, &writer),
+              Not(IsOk()));
 }
 
 }  // namespace

@@ -413,6 +413,13 @@ absl::Status SerializeToRiegeli(mlir::ModuleOp mlir_module,
         absl::StrCat("Failed to serialize StableHLO to plugin version ", target,
                      ";\n\nDetailed error from MLIR: ", status.message()));
   }
+
+  // The raw_ostream APIs don't have support for reporting I/O errors, so we
+  // have to check them ourselves.
+  if (!writer->ok()) {
+    return writer->status();
+  }
+
   return absl::OkStatus();
 }
 
