@@ -26,6 +26,7 @@ limitations under the License.
 #include <memory>
 #include <optional>
 #include <ostream>
+#include <random>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -20009,6 +20010,501 @@ TEST_F(MemorySpaceAssignmentTest, FindBestChunkCandidatesEmptyChunkCandidates) {
   std::vector<Chunk> result = algorithm.FindBestChunkCandidates(
       request, &preferred_offset, &sliced_interval);
   EXPECT_THAT(result, ::testing::IsEmpty());
+}
+
+// Test subclass of MsaAlgorithm that exposes chunk commits and counts the
+// BufferIntervalTree searches FindBestChunkCandidates performs.
+class SearchCountingMsaAlgorithm : public MsaAlgorithm {
+ public:
+  using MsaAlgorithm::CommitChunkAndUpdatePeakMemory;
+  using MsaAlgorithm::CommittedBytes;
+  using MsaAlgorithm::FindBestChunkCandidates;
+  using MsaAlgorithm::MsaAlgorithm;
+
+  std::vector<Chunk> FindChunkCandidates(
+      const SlicedBufferInterval& sliced_buffer_interval,
+      int64_t preferred_offset) const override {
+    ++num_searches_;
+    return MsaAlgorithm::FindChunkCandidates(sliced_buffer_interval,
+                                             preferred_offset);
+  }
+
+  int num_searches() const { return num_searches_; }
+
+ private:
+  mutable int num_searches_ = 0;
+};
+
+// FindBestChunkCandidates consults the bytes committed per time before
+// searching the BufferIntervalTree for an unsliced request: when the committed
+// bytes plus the request size exceed the memory limit somewhere in the
+// interval, no chunk within the limit can exist and the search is skipped. The
+// result is the same empty result the search would produce. Sliced requests
+// are always searched, because their earlier slices need less memory than the
+// whole buffer.
+TEST_F(MemorySpaceAssignmentTest,
+       FindBestChunkCandidatesSkipsSearchWhenCommittedBytesRuleOut) {
+  absl::string_view hlo_string = R"hlo(
+HloModule module, is_scheduled=true
+
+ENTRY entry {
+  p0 = f32[2,3]{1,0} parameter(0)
+  negate0 = f32[2,3]{1,0} negate(p0)
+  negate1 = f32[2,3]{1,0} negate(negate0)
+  negate2 = f32[2,3]{1,0} negate(negate1)
+  negate3 = f32[2,3]{1,0} negate(negate2)
+  negate4 = f32[2,3]{1,0} negate(negate3)
+  negate5 = f32[2,3]{1,0} negate(negate4)
+  negate6 = f32[2,3]{1,0} negate(negate5)
+  negate7 = f32[2,3]{1,0} negate(negate6)
+  negate8 = f32[2,3]{1,0} negate(negate7)
+  negate9 = f32[2,3]{1,0} negate(negate8)
+  ROOT negate10 = f32[2,3]{1,0} negate(negate9)
+}
+  )hlo";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(hlo_string));
+  AllocationSequence allocations;
+  // 128 bytes of alternate memory, aligned to 8 bytes.
+  Options options = DefaultMemorySpaceOptions();
+  InstructionCountPrefetchIntervalPicker prefetch_interval_picker(2, 10);
+  options.prefetch_interval_picker = &prefetch_interval_picker;
+  ASSERT_OK_AND_ASSIGN(auto alias_analysis,
+                       HloAliasAnalysis::Run(module.get(), &alias_info_));
+  ASSERT_OK_AND_ASSIGN(auto hlo_live_range,
+                       HloLiveRange::Run(module->schedule(), *alias_analysis,
+                                         module->entry_computation()));
+  SearchCountingMsaAlgorithm algorithm(module.get(), &allocations, options,
+                                       *alias_analysis, &alias_info_,
+                                       *hlo_live_range);
+  using SlicedBufferInterval =
+      GlobalDecreasingSizeBestFitHeap<HloValue>::SlicedBufferInterval;
+
+  // Occupy [0, 96) of the alternate memory during times [4, 6].
+  MsaBufferInterval occupied;
+  occupied.buffer = nullptr;
+  occupied.size = 96;
+  occupied.start = 4;
+  occupied.end = 6;
+  occupied.need_allocation = true;
+  algorithm.CommitChunkAndUpdatePeakMemory(occupied,
+                                           Chunk::FromOffsetSize(0, 96));
+
+  const HloInstruction* p0 = FindInstruction(module.get(), "p0");
+  const HloValue& p0_value =
+      alias_analysis->dataflow_analysis().GetUniqueValueAt(p0);
+  const std::vector<int64_t> use_times = {10};
+  AllocationValue allocation_value(&p0_value, p0_value.defining_position(),
+                                   /*size=*/64);
+  AllocationRequest request;
+  request.end_time = 10;
+  request.all_use_times = use_times;
+  request.allocation_value_to_update = &allocation_value;
+
+  auto find = [&](int64_t start, int64_t end, int64_t size,
+                  AliasedOffset* preferred_offset) {
+    MsaBufferInterval interval;
+    interval.buffer = &p0_value;
+    interval.size = size;
+    interval.start = start;
+    interval.end = end;
+    interval.need_allocation = true;
+    SlicedBufferInterval sliced_interval =
+        SlicedBufferInterval::CreateMutableInterval(interval);
+    return algorithm.FindBestChunkCandidates(request, preferred_offset,
+                                             &sliced_interval);
+  };
+  AliasedOffset offset_96{/*offset=*/96};
+  AliasedOffset offset_0{/*offset=*/0};
+  AliasedOffset offset_64{/*offset=*/64};
+
+  // 96 + 64 bytes exceed the limit at times 4 to 6: no search.
+  EXPECT_THAT(find(0, 10, 64, &offset_96), ::testing::IsEmpty());
+  EXPECT_EQ(algorithm.num_searches(), 0);
+  EXPECT_THAT(find(0, 10, 64, nullptr), ::testing::IsEmpty());
+  EXPECT_EQ(algorithm.num_searches(), 0);
+  // The interval end is inclusive: an interval ending at time 4 overlaps the
+  // occupied times.
+  EXPECT_THAT(find(0, 4, 64, &offset_96), ::testing::IsEmpty());
+  EXPECT_EQ(algorithm.num_searches(), 0);
+
+  // 96 + 32 bytes fit exactly, so the tree is searched and finds [96, 128).
+  EXPECT_THAT(find(0, 10, 32, &offset_96),
+              ::testing::ElementsAre(Chunk::FromOffsetSize(96, 32)));
+  EXPECT_EQ(algorithm.num_searches(), 1);
+  EXPECT_THAT(find(0, 10, 32, nullptr),
+              ::testing::ElementsAre(Chunk::FromOffsetSize(96, 32)));
+  EXPECT_EQ(algorithm.num_searches(), 2);
+
+  // An interval that avoids the occupied times is searched.
+  EXPECT_THAT(find(7, 10, 64, &offset_0),
+              ::testing::ElementsAre(Chunk::FromOffsetSize(0, 64)));
+  EXPECT_EQ(algorithm.num_searches(), 3);
+
+  // A sliced request for the same 64 bytes: only the first 32 byte slice is
+  // live at times 4 to 6, so a placement exists and the tree must be
+  // searched. The slice copied at time 0 takes [96, 128), the only 32 free
+  // bytes at times 4 to 6; the slice copied at time 7 fills [64, 96) below it,
+  // so the whole buffer sits at the preferred offset 64.
+  MsaBufferInterval interval;
+  interval.buffer = &p0_value;
+  interval.size = 64;
+  interval.start = 0;
+  interval.end = 10;
+  interval.need_allocation = true;
+  SlicedBufferInterval sliced_interval =
+      SlicedBufferInterval::CreateMutableInterval(interval);
+  sliced_interval.Slice({32, 32});
+  sliced_interval.UpdateInclusiveSliceStartTimes({0, 7});
+  std::vector<Chunk> sliced_chunks =
+      algorithm.FindBestChunkCandidates(request, &offset_64, &sliced_interval);
+  EXPECT_EQ(algorithm.num_searches(), 4);
+  ASSERT_EQ(sliced_chunks.size(), 2);
+  EXPECT_EQ(sliced_chunks[0], Chunk::FromOffsetSize(96, 32));
+  EXPECT_EQ(sliced_chunks[1], Chunk::FromOffsetSize(64, 32));
+}
+
+using CommittedBytes = SearchCountingMsaAlgorithm::CommittedBytes;
+using CommittedRange = CommittedBytes::Range;
+
+// Windows that span several blocks of 64 times, with the maximum inside a
+// block that the window covers entirely, at a block boundary, and in a
+// partially covered block.
+TEST_F(MemorySpaceAssignmentTest, CommittedBytesMaxInRangeAcrossBlocks) {
+  CommittedBytes committed(/*num_times=*/1000);
+  committed.Add(0, 999, 1);
+  committed.Add(200, 300, 4);   // Covers block 4 (256..319) partially.
+  committed.Add(500, 520, 9);   // Inside block 7 (448..511) and 8 (512..575).
+  committed.Add(639, 640, 20);  // Straddles the boundary of blocks 9 and 10.
+  committed.Add(7, 6, 100);     // Empty range: no effect.
+  EXPECT_EQ(committed.MaxInRange(0, 999), 21);
+  EXPECT_EQ(committed.MaxInRange(0, 199), 1);
+  EXPECT_EQ(committed.MaxInRange(0, 200), 5);
+  EXPECT_EQ(committed.MaxInRange(301, 499), 1);
+  EXPECT_EQ(committed.MaxInRange(301, 500), 10);
+  EXPECT_EQ(committed.MaxInRange(64, 638), 10);
+  EXPECT_EQ(committed.MaxInRange(639, 639), 21);
+  EXPECT_EQ(committed.MaxInRange(641, 999), 1);
+  EXPECT_EQ(committed.MaxInRange(521, 638), 1);
+}
+
+// Removing bytes lowers the block maxima again, both for blocks fully inside
+// the removed range and for partially covered blocks.
+TEST_F(MemorySpaceAssignmentTest, CommittedBytesNegativeAddLowersBlockMaxima) {
+  CommittedBytes committed(/*num_times=*/512);
+  committed.Add(0, 511, 5);
+  committed.Add(100, 400, 7);
+  EXPECT_EQ(committed.MaxInRange(0, 511), 12);
+  committed.Add(100, 400, -7);
+  EXPECT_EQ(committed.MaxInRange(0, 511), 5);
+  EXPECT_EQ(committed.MaxInRange(128, 383), 5);
+  // Blocks 1 and 2 (times 64 to 191) go down to 0 except for time 130, and
+  // the windows below read them through their block maxima.
+  committed.Add(130, 130, 3);
+  committed.Add(64, 191, -5);
+  EXPECT_EQ(committed.MaxInRange(64, 191), 3);
+  committed.Add(0, 63, -5);
+  committed.Add(192, 255, -5);
+  EXPECT_EQ(committed.MaxInRange(0, 255), 3);
+  committed.Add(130, 130, -3);
+  EXPECT_EQ(committed.MaxInRange(0, 255), 0);
+  EXPECT_EQ(committed.MaxInRange(0, 511), 5);
+}
+
+TEST_F(MemorySpaceAssignmentTest,
+       CommittedBytesMatchesReferenceUnderRandomUpdates) {
+  constexpr int64_t kNumTimes = 1000;
+  std::mt19937_64 rng(2026);
+  std::uniform_int_distribution<int64_t> time_dist(0, kNumTimes - 1);
+  std::uniform_int_distribution<int64_t> bytes_dist(1, 1000);
+  std::bernoulli_distribution remove_dist(0.5);
+
+  CommittedBytes committed(kNumTimes);
+  std::vector<int64_t> reference(kNumTimes, 0);
+  struct Update {
+    int64_t start;
+    int64_t end;
+    int64_t bytes;
+  };
+  std::vector<Update> live_updates;
+  for (int step = 0; step < 5000; ++step) {
+    Update update;
+    if (!live_updates.empty() && remove_dist(rng)) {
+      std::uniform_int_distribution<int64_t> index_dist(
+          0, live_updates.size() - 1);
+      const int64_t index = index_dist(rng);
+      update = live_updates[index];
+      update.bytes = -update.bytes;
+      live_updates[index] = live_updates.back();
+      live_updates.pop_back();
+    } else {
+      int64_t start = time_dist(rng);
+      int64_t end = time_dist(rng);
+      if (start > end) {
+        std::swap(start, end);
+      }
+      update = {start, end, bytes_dist(rng)};
+      live_updates.push_back(update);
+    }
+    committed.Add(update.start, update.end, update.bytes);
+    for (int64_t time = update.start; time <= update.end; ++time) {
+      reference[time] += update.bytes;
+    }
+    int64_t query_start = time_dist(rng);
+    int64_t query_end = time_dist(rng);
+    if (query_start > query_end) {
+      std::swap(query_start, query_end);
+    }
+    ASSERT_EQ(committed.MaxInRange(query_start, query_end),
+              *std::max_element(reference.begin() + query_start,
+                                reference.begin() + query_end + 1))
+        << "step " << step << " window [" << query_start << ", " << query_end
+        << "]";
+    ASSERT_EQ(committed.Get(query_start), reference[query_start]);
+  }
+}
+
+// Overlapping byte ranges count once: two chunks at one offset that touch in
+// time, a chunk nested in another one in time and space, a shorter chunk at
+// the offset of a longer one, and disjoint chunks that add up. Ranges with
+// start_time > end_time or size 0 are ignored, and the previous contents are
+// replaced.
+TEST_F(MemorySpaceAssignmentTest, CommittedBytesAssignUnionCountsOverlapsOnce) {
+  CommittedBytes committed(/*num_times=*/14);
+  committed.Add(0, 13, 1000);
+  committed.AssignUnion(std::vector<CommittedRange>{
+      {/*start_time=*/2, /*end_time=*/7, /*offset=*/0, /*size=*/48},
+      {/*start_time=*/7, /*end_time=*/10, /*offset=*/0, /*size=*/48},
+      {/*start_time=*/4, /*end_time=*/5, /*offset=*/16, /*size=*/16},
+      {/*start_time=*/9, /*end_time=*/12, /*offset=*/0, /*size=*/64},
+      {/*start_time=*/3, /*end_time=*/10, /*offset=*/48, /*size=*/48},
+      {/*start_time=*/11, /*end_time=*/12, /*offset=*/96, /*size=*/8},
+      {/*start_time=*/5, /*end_time=*/4, /*offset=*/0, /*size=*/8},
+      {/*start_time=*/1, /*end_time=*/2, /*offset=*/0, /*size=*/0},
+  });
+  std::vector<int64_t> bytes;
+  for (int64_t time = 0; time < committed.num_times(); ++time) {
+    bytes.push_back(committed.Get(time));
+  }
+  EXPECT_THAT(bytes, ::testing::ElementsAre(0, 0, 48, 96, 96, 96, 96, 96, 96,
+                                            96, 96, 72, 72, 0));
+  EXPECT_EQ(committed.MaxInRange(0, 13), 96);
+  EXPECT_EQ(committed.MaxInRange(11, 13), 72);
+}
+
+// Random ranges against a per time bitmap union, including the block maxima
+// MaxInRange reads after AssignUnion.
+TEST_F(MemorySpaceAssignmentTest, CommittedBytesAssignUnionMatchesBruteForce) {
+  constexpr int64_t kNumTimes = 300;
+  constexpr int64_t kLimit = 256;
+  std::mt19937_64 rng(2026);
+  std::uniform_int_distribution<int64_t> time_dist(0, kNumTimes - 1);
+  std::uniform_int_distribution<int64_t> offset_dist(0, kLimit - 1);
+  std::uniform_int_distribution<int64_t> size_dist(1, 64);
+  std::uniform_int_distribution<int> count_dist(0, 40);
+
+  CommittedBytes committed(kNumTimes);
+  for (int round = 0; round < 200; ++round) {
+    std::vector<CommittedRange> ranges;
+    const int count = count_dist(rng);
+    for (int i = 0; i < count; ++i) {
+      int64_t start = time_dist(rng);
+      int64_t end = time_dist(rng);
+      if (start > end) {
+        std::swap(start, end);
+      }
+      const int64_t offset = offset_dist(rng);
+      ranges.push_back(
+          {start, end, offset, std::min(size_dist(rng), kLimit - offset)});
+    }
+    committed.AssignUnion(ranges);
+    for (int64_t time = 0; time < kNumTimes; ++time) {
+      std::vector<bool> covered(kLimit, false);
+      for (const CommittedRange& range : ranges) {
+        if (range.start_time <= time && time <= range.end_time) {
+          std::fill(covered.begin() + range.offset,
+                    covered.begin() + range.offset + range.size, true);
+        }
+      }
+      ASSERT_EQ(committed.Get(time),
+                std::count(covered.begin(), covered.end(), true))
+          << "round " << round << " time " << time;
+    }
+    int64_t query_start = time_dist(rng);
+    int64_t query_end = time_dist(rng);
+    if (query_start > query_end) {
+      std::swap(query_start, query_end);
+    }
+    int64_t expected_max = 0;
+    for (int64_t time = query_start; time <= query_end; ++time) {
+      expected_max = std::max(expected_max, committed.Get(time));
+    }
+    ASSERT_EQ(committed.MaxInRange(query_start, query_end), expected_max)
+        << "round " << round;
+  }
+}
+
+// A repacker that keeps every block at its offset, reports a modification so
+// that the blocks are imported, and records whether two colocated blocks
+// overlap in time. The import of such blocks puts two chunks at one offset
+// into the interval tree at their shared times.
+class ImportingRepacker : public MemorySpaceAssignmentRepacker {
+ public:
+  ImportingRepacker()
+      : MemorySpaceAssignmentRepacker(/*max_size=*/128, /*alignment=*/8) {}
+
+  absl::StatusOr<bool> Repack(
+      absl::Span<AllocationBlock*> allocations) override {
+    ++num_repacks_;
+    for (AllocationBlock* block : allocations) {
+      for (AllocationBlock* colocation : block->GetColocations()) {
+        colocation->offset = colocation->initial_offset;
+        if (colocation != block &&
+            colocation->inclusive_start_time <= block->end_time &&
+            block->inclusive_start_time <= colocation->end_time) {
+          colocated_blocks_overlap_in_time_ = true;
+        }
+      }
+    }
+    return true;
+  }
+
+  int num_repacks() const { return num_repacks_; }
+  bool colocated_blocks_overlap_in_time() const {
+    return colocated_blocks_overlap_in_time_;
+  }
+
+ private:
+  int num_repacks_ = 0;
+  bool colocated_blocks_overlap_in_time_ = false;
+};
+
+// Times: p0 0, p1 1, a 2, b 3, c0 4, c1 5, c2 6, fusion 7, c3 8, c4 9, d 10,
+// tuple 11. Buffer a is processed first: a lives in alternate memory over
+// [2, 7] and the in place fusion output over [7, 10] at the same offset, with
+// committed chunks [2, 7] and [8, 10]. The repack after that allocation
+// exports both as colocated blocks [2, 7] and [7, 10], which the import puts
+// into the interval tree at one offset, overlapping at time 7. Buffer b (48
+// bytes, live [3, 10]) is processed after the import: at time 7 the true
+// occupancy is 48 bytes, so b fits next to them without a copy.
+TEST_F(MemorySpaceAssignmentTest, NoCopyAllocationSurvivesRepackImport) {
+  absl::string_view hlo_string = R"hlo(
+HloModule module, is_scheduled=true
+
+fused_computation {
+  param0 = f32[12] parameter(0)
+  param1 = f32[4] parameter(1)
+  constant = s32[] constant(0)
+  ROOT dus = f32[12] dynamic-update-slice(param0, param1, constant)
+}
+
+ENTRY entry {
+  p0 = f32[12] parameter(0)
+  p1 = f32[4] parameter(1)
+  a = f32[12] negate(p0)
+  b = f32[12] negate(p0)
+  c0 = f32[4] negate(p1)
+  c1 = f32[4] negate(c0)
+  c2 = f32[4] negate(c1)
+  fusion = f32[12] fusion(a, c2), kind=kLoop, calls=fused_computation
+  c3 = f32[4] negate(c2)
+  c4 = f32[4] negate(c3)
+  d = f32[12] add(fusion, b)
+  ROOT tuple = (f32[12], f32[4]) tuple(d, c4)
+}
+  )hlo";
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hlo_string));
+
+  ImportingRepacker repacker;
+  Options options = DefaultMemorySpaceOptions();
+  options.max_repacks = 2;
+  options.repack_after_every_allocation = true;
+  options.repacker = &repacker;
+  InstructionCountPrefetchIntervalPicker prefetch_interval_picker(2, 10);
+  std::unique_ptr<PresetAssignments> preset_assignments = AssignMemorySpace(
+      module.get(), std::move(options),
+      CreateBufferIntervalCompareFnFromInstructionNames({"a", "b"}),
+      &prefetch_interval_picker);
+  EXPECT_GE(repacker.num_repacks(), 2);
+  EXPECT_TRUE(repacker.colocated_blocks_overlap_in_time());
+
+  HloComputation* entry = module->entry_computation();
+  const int64_t a_offset = GetAlternateMemoryOffset(
+      *preset_assignments, entry->GetInstructionWithName("a"));
+  EXPECT_NE(a_offset, -1);
+  EXPECT_EQ(a_offset,
+            GetAlternateMemoryOffset(*preset_assignments,
+                                     entry->GetInstructionWithName("fusion")));
+  EXPECT_NE(GetAlternateMemoryOffset(*preset_assignments,
+                                     entry->GetInstructionWithName("b")),
+            -1);
+  EXPECT_EQ(entry->GetInstructionWithName("d")->operand(1),
+            entry->GetInstructionWithName("b"));
+}
+
+// The same module with p2 and x added, so the schedule shifts by one and the
+// repack is triggered the production way: buffer x (128 bytes, live [5, 11],
+// kept live by y) cannot fit next to a, fails out of memory and triggers the
+// one allowed repack. b is processed after the import and fits.
+TEST_F(MemorySpaceAssignmentTest,
+       NoCopyAllocationSurvivesOutOfMemoryTriggeredRepackImport) {
+  absl::string_view hlo_string = R"hlo(
+HloModule module, is_scheduled=true
+
+fused_computation {
+  param0 = f32[12] parameter(0)
+  param1 = f32[4] parameter(1)
+  constant = s32[] constant(0)
+  ROOT dus = f32[12] dynamic-update-slice(param0, param1, constant)
+}
+
+ENTRY entry {
+  p0 = f32[12] parameter(0)
+  p1 = f32[4] parameter(1)
+  p2 = f32[32] parameter(2)
+  a = f32[12] negate(p0)
+  b = f32[12] negate(p0)
+  x = f32[32] negate(p2)
+  c0 = f32[4] negate(p1)
+  c1 = f32[4] negate(c0)
+  c2 = f32[4] negate(c1)
+  fusion = f32[12] fusion(a, c2), kind=kLoop, calls=fused_computation
+  c3 = f32[4] negate(c2)
+  y = f32[32] negate(x)
+  c4 = f32[4] negate(c3)
+  d = f32[12] add(fusion, b)
+  ROOT tuple = (f32[12], f32[4], f32[32]) tuple(d, c4, y)
+}
+  )hlo";
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hlo_string));
+
+  ImportingRepacker repacker;
+  Options options = DefaultMemorySpaceOptions();
+  options.max_repacks = 1;
+  options.repacker = &repacker;
+  InstructionCountPrefetchIntervalPicker prefetch_interval_picker(2, 10);
+  std::unique_ptr<PresetAssignments> preset_assignments = AssignMemorySpace(
+      module.get(), std::move(options),
+      CreateBufferIntervalCompareFnFromInstructionNames({"a", "x", "b"}),
+      &prefetch_interval_picker);
+  EXPECT_EQ(repacker.num_repacks(), 1);
+  EXPECT_TRUE(repacker.colocated_blocks_overlap_in_time());
+
+  HloComputation* entry = module->entry_computation();
+  const int64_t a_offset = GetAlternateMemoryOffset(
+      *preset_assignments, entry->GetInstructionWithName("a"));
+  EXPECT_NE(a_offset, -1);
+  EXPECT_EQ(a_offset,
+            GetAlternateMemoryOffset(*preset_assignments,
+                                     entry->GetInstructionWithName("fusion")));
+  EXPECT_EQ(GetAlternateMemoryOffset(*preset_assignments,
+                                     entry->GetInstructionWithName("x")),
+            -1);
+  EXPECT_NE(GetAlternateMemoryOffset(*preset_assignments,
+                                     entry->GetInstructionWithName("b")),
+            -1);
+  EXPECT_EQ(entry->GetInstructionWithName("d")->operand(1),
+            entry->GetInstructionWithName("b"));
 }
 
 }  // namespace
