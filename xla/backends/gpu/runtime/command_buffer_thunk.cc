@@ -172,12 +172,6 @@ absl::Status CommandBufferThunk::Initialize(const InitializeParams& params) {
   // Initialize commands.
   ABSL_RETURN_IF_ERROR(commands_.Initialize(params));
 
-  // Always initialize thunks if they are present so we are ready to fall back
-  // on them if we detect profiling activity.
-  if (thunks_) {
-    ABSL_RETURN_IF_ERROR(thunks_->Initialize(params));
-  }
-
   // TODO(b/290773547): Disabled CUDA graphs when profiling is active because of
   // memory corruption.
   if (tsl::profiler::ProfilerLock::HasActiveSession() && thunks_ &&
