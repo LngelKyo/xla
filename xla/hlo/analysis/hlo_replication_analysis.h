@@ -26,11 +26,14 @@ limitations under the License.
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/container/node_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
+#include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
+#include "xla/shape_tree.h"
 #include "xla/xla_data.pb.h"
 
 namespace xla {
@@ -123,13 +126,17 @@ class HloReplicationAnalysis {
     bool operator==(const HloReplication& rhs) const;
     bool IsReplicatedOnAllDevices() const;
     bool IsUniqueOnAllDevices() const;
+    bool IsPartiallyReplicated() const;
     bool IsReplicatedWithinSubgroup(absl::Span<const int64_t> device_ids) const;
     std::string ToString() const;
 
     template <typename H>
     friend H AbslHashValue(H h, const HloReplication& r) {
-      return H::combine(std::move(h), r.state_,
-                        *r.device_set_root_per_replica_);
+      h = H::combine(std::move(h), r.state_);
+      if (r.device_set_root_per_replica_ != nullptr) {
+        h = H::combine(std::move(h), *r.device_set_root_per_replica_);
+      }
+      return h;
     }
 
    private:
@@ -138,8 +145,10 @@ class HloReplicationAnalysis {
       kUniqueOnAllDevices = 1,
       kPartiallyReplicated = 2,
     };
+    // Only partially replicated values carry device sets; the other two states
+    // share a null pointer so that copying them is a plain state copy.
+    explicit HloReplication(State state);
     explicit HloReplication(
-        State state,
         absl::Span<const std::vector<int64_t>> device_set_root_per_replica);
     State state_;
     // Helper class that subclasses T, and computes the hash once on
@@ -161,15 +170,17 @@ class HloReplicationAnalysis {
         return H::combine(std::move(h), r.hash_);
       }
     };
-    // Empty if state_ is kReplicatedOnAllDevices or kUniqueOnAllDevices.
-
-    // If cross_partition_spmd is true, groups_for_replicas_[k]'s size equals
-    // the number of partitions, and within replica k, groups_for_replicas_[k]
-    // maps each partition ID to the smallest partition ID in the set.
+    // Null if state_ is kReplicatedOnAllDevices or kUniqueOnAllDevices.
     //
-    // If cross_partition_spmd is false, groups_for_replicas_[k]'s size equals
-    // the number of replicas, and within partition k, groups_for_replicas_[k]
-    // maps each replica to the smallest replica ID in the set.
+    // If cross_partition_spmd is true, device_set_root_per_replica_[k]'s size
+    // equals the number of partitions, and within replica k,
+    // device_set_root_per_replica_[k] maps each partition ID to the smallest
+    // partition ID in the set.
+    //
+    // If cross_partition_spmd is false, device_set_root_per_replica_[k]'s size
+    // equals the number of replicas, and within partition k,
+    // device_set_root_per_replica_[k] maps each replica to the smallest replica
+    // ID in the set.
     std::shared_ptr<const HashOnConstruction<std::vector<std::vector<int64_t>>>>
         device_set_root_per_replica_;
   };
@@ -182,6 +193,13 @@ class HloReplicationAnalysis {
 
   HloReplication MergeReplications(const HloReplication& replication_a,
                                    const HloReplication& replication_b) {
+    // Merging with a value that is replicated or unique on all devices is a
+    // copy of one side; only merges of two partially replicated values are
+    // worth memoizing.
+    if (!replication_a.IsPartiallyReplicated() ||
+        !replication_b.IsPartiallyReplicated()) {
+      return replication_a.Merge(replication_b);
+    }
     std::pair<HloReplication, HloReplication> key = {replication_a,
                                                      replication_b};
 
@@ -214,6 +232,34 @@ class HloReplicationAnalysis {
   bool ComputeHloReplicationOnComputation(const HloComputation* computation,
                                           bool mark_everything_not_replicated);
 
+  // Returns the post order of `computation`. The module does not change during
+  // the analysis, so the order is computed once per computation.
+  const std::vector<HloInstruction*>& InstructionPostOrder(
+      const HloComputation* computation);
+
+  // Returns the replication of `inst`, which must have been computed already.
+  const ShapeTree<HloReplication>& GetReplication(
+      const HloInstruction* inst) const;
+
+  // Merges `source` into `dest` element by element. Returns whether anything
+  // changed.
+  bool CombineReplication(const ShapeTree<HloReplication>& source,
+                          ShapeTree<HloReplication>* dest);
+
+  // Assigns `replication` to `dest` if it has none yet, or combines it with
+  // the existing one. Returns whether anything changed.
+  bool AssignOrCombineReplication(ShapeTree<HloReplication> replication,
+                                  const HloInstruction* dest);
+
+  // Assigns or combines the replication of `source` to `dest`. Returns whether
+  // anything changed; nothing changes if `source` has no replication yet.
+  bool PropagateReplication(const HloInstruction* source,
+                            const HloInstruction* dest);
+
+  // Marks `inst` unique on all devices at every index. Returns whether
+  // anything changed.
+  bool MarkNotReplicated(const HloInstruction* inst);
+
   // Builds the replica group dedup map that allows caching replication
   // calculations for all-reduce/all-gather that share the same replica groups.
   // This can significantly help in compile times when replica groups are very
@@ -245,9 +291,30 @@ class HloReplicationAnalysis {
 
   // A map from each analyzed HLO instruction to a shape tree that represents
   // whether the instruction outputs the same value across replicas or
-  // partitions at each shape index.
+  // partitions at each shape index. Trees built during the walk point at an
+  // instruction's shape instead of copying it (a propagated tree points at the
+  // shape of the instruction it was copied from). Never read such a tree's
+  // shape() after the analysis has run: HloInstruction::mutable_shape() and
+  // shape canonicalization replace the pointed Shape object, and callers
+  // delete instructions while they hold the analysis. Queries use only the
+  // index table and the node values, so they stay valid.
   absl::flat_hash_map<const HloInstruction*, ShapeTree<HloReplication>>
       hlo_replication_;
+
+  // Post order of every computation analyzed so far. The values must not move
+  // when the map grows, since a visit of a nested computation adds an entry
+  // while the caller iterates over its own post order.
+  absl::node_hash_map<const HloComputation*, std::vector<HloInstruction*>>
+      post_orders_;
+
+  // Computations already visited with mark_everything_not_replicated set.
+  // That visit marks the parameters and every ordinary instruction unique;
+  // tuples, get-tuple-elements, optimization barriers and nested calls derive
+  // from those values and infeeds from their sharding, and replication only
+  // moves towards unique, so a repeat visit with the flag set would recompute
+  // the same values and is skipped.
+  absl::flat_hash_set<const HloComputation*>
+      computations_marked_not_replicated_;
 
   // Replications for all-reduce/all-gather that have the same replica groups is
   // usually identical. We use the following data structures to memoize the

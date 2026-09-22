@@ -310,43 +310,98 @@ HloReplicationAnalysis::DetermineHloInstructionIsReplicated(
   return HloReplication::UniqueOnAllDevices();
 }
 
+const std::vector<HloInstruction*>&
+HloReplicationAnalysis::InstructionPostOrder(
+    const HloComputation* computation) {
+  auto [it, inserted] = post_orders_.try_emplace(computation);
+  if (inserted) {
+    it->second = computation->MakeInstructionPostOrder();
+  }
+  return it->second;
+}
+
+const ShapeTree<HloReplicationAnalysis::HloReplication>&
+HloReplicationAnalysis::GetReplication(const HloInstruction* inst) const {
+  auto it = hlo_replication_.find(inst);
+  CHECK(it != hlo_replication_.end())
+      << inst->name() << " has no replication yet";
+  return it->second;
+}
+
+bool HloReplicationAnalysis::CombineReplication(
+    const ShapeTree<HloReplication>& source, ShapeTree<HloReplication>* dest) {
+  bool updated = false;
+  // Both trees are built from compatible shapes, so their pre order nodes line
+  // up one to one.
+  auto source_node = source.begin();
+  for (ShapeTree<HloReplication>::Node& node : *dest) {
+    CHECK(source_node != source.end())
+        << "source tree ends before " << node.first;
+    CHECK(source_node->first == node.first)
+        << source_node->first << " vs " << node.first;
+    HloReplication new_replication =
+        MergeReplications(node.second, source_node->second);
+    if (!node.second.Equal(new_replication)) {
+      node.second = std::move(new_replication);
+      updated = true;
+    }
+    ++source_node;
+  }
+  return updated;
+}
+
+bool HloReplicationAnalysis::AssignOrCombineReplication(
+    ShapeTree<HloReplication> replication, const HloInstruction* dest) {
+  auto [it, inserted] =
+      hlo_replication_.try_emplace(dest, std::move(replication));
+  if (inserted) {
+    return true;
+  }
+  // try_emplace leaves `replication` untouched when the key exists.
+  return CombineReplication(replication, &it->second);
+}
+
+bool HloReplicationAnalysis::PropagateReplication(const HloInstruction* source,
+                                                  const HloInstruction* dest) {
+  auto source_it = hlo_replication_.find(source);
+  if (source_it == hlo_replication_.end()) {
+    return false;
+  }
+  auto dest_it = hlo_replication_.find(dest);
+  if (dest_it != hlo_replication_.end()) {
+    return CombineReplication(source_it->second, &dest_it->second);
+  }
+  // Copy before inserting: the insertion may rehash the map.
+  ShapeTree<HloReplication> copy(source_it->second);
+  hlo_replication_.try_emplace(dest, std::move(copy));
+  return true;
+}
+
+bool HloReplicationAnalysis::MarkNotReplicated(const HloInstruction* inst) {
+  auto [it, inserted] = hlo_replication_.try_emplace(
+      inst, &inst->shape(), HloReplication::UniqueOnAllDevices());
+  if (inserted) {
+    return true;
+  }
+  bool updated = false;
+  for (ShapeTree<HloReplication>::Node& node : it->second) {
+    if (!node.second.IsUniqueOnAllDevices()) {
+      node.second = HloReplication::UniqueOnAllDevices();
+      updated = true;
+    }
+  }
+  return updated;
+}
+
 bool HloReplicationAnalysis::ComputeHloReplicationOnComputation(
     const HloComputation* computation, bool mark_everything_not_replicated) {
+  // A repeat visit with everything marked unique cannot change anything.
+  if (mark_everything_not_replicated &&
+      !computations_marked_not_replicated_.insert(computation).second) {
+    return false;
+  }
   bool changed = false;
-  for (const HloInstruction* inst : computation->MakeInstructionPostOrder()) {
-    // Assigns the shape tree to dest if dest doesn't have one yet, or combines
-    // it with the existing one by and'ing them. Returns if anything is updated.
-    auto assign_or_combine_shapetree =
-        [&](ShapeTree<HloReplication>&& to_combine,
-            const HloInstruction* dest) {
-          auto it = hlo_replication_.find(dest);
-          if (it == hlo_replication_.end()) {
-            hlo_replication_[dest] = std::move(to_combine);
-            return true;
-          }
-          bool updated = false;
-          it->second.ForEachMutableElement(
-              [&](const ShapeIndex& index, HloReplication* element) {
-                HloReplication new_replication =
-                    MergeReplications(*element, to_combine.element(index));
-                if (!element->Equal(new_replication)) {
-                  *element = std::move(new_replication);
-                  updated = true;
-                }
-              });
-          return updated;
-        };
-    // Assigns or combines source's shape tree to dest. Returns if anything is
-    // updated.
-    auto propagate_shapetree = [&](const HloInstruction* source,
-                                   const HloInstruction* dest) {
-      auto source_it = hlo_replication_.find(source);
-      if (source_it == hlo_replication_.end()) {
-        return false;
-      }
-      return assign_or_combine_shapetree(
-          ShapeTree<HloReplication>(source_it->second), dest);
-    };
+  for (const HloInstruction* inst : InstructionPostOrder(computation)) {
     // For the opcodes below that we do special handling, we don't need to
     // explicitly check mark_everything_not_replicated because if it is set, the
     // operands should already be marked as not replicated.
@@ -356,24 +411,24 @@ bool HloReplicationAnalysis::ComputeHloReplicationOnComputation(
       while (true) {
         // First, propagate the input's and body root's shape trees to the
         // parameters of the body and condition.
-        bool updated = propagate_shapetree(
+        bool updated = PropagateReplication(
             inst->operand(0),
             inst->while_condition()->parameter_instruction(0));
-        updated |= propagate_shapetree(
+        updated |= PropagateReplication(
             inst->while_body()->root_instruction(),
             inst->while_condition()->parameter_instruction(0));
-        updated |= propagate_shapetree(
+        updated |= PropagateReplication(
             inst->operand(0), inst->while_body()->parameter_instruction(0));
         updated |=
-            propagate_shapetree(inst->while_body()->root_instruction(),
-                                inst->while_body()->parameter_instruction(0));
+            PropagateReplication(inst->while_body()->root_instruction(),
+                                 inst->while_body()->parameter_instruction(0));
         // Compute the condition.
         updated |= ComputeHloReplicationOnComputation(
             inst->while_condition(), mark_everything_not_replicated);
         // Compute the body. If the condition is not replicated, the while body
         // should be different across replicas.
         if (!ContainsKey(loops_known_with_same_iterations_, inst) &&
-            !hlo_replication_[inst->while_condition()->root_instruction()]
+            !GetReplication(inst->while_condition()->root_instruction())
                  .element({})
                  .IsReplicatedOnAllDevices()) {
           updated |= ComputeHloReplicationOnComputation(
@@ -388,9 +443,9 @@ bool HloReplicationAnalysis::ComputeHloReplicationOnComputation(
         changed = true;
       }
       // Propagate the input's and body root's shape trees to the while HLO.
-      changed |= propagate_shapetree(inst->operand(0), inst);
+      changed |= PropagateReplication(inst->operand(0), inst);
       changed |=
-          propagate_shapetree(inst->while_body()->root_instruction(), inst);
+          PropagateReplication(inst->while_body()->root_instruction(), inst);
     } else if (inst->opcode() == HloOpcode::kCall ||
                inst->opcode() == HloOpcode::kFusion) {
       auto called = inst->called_computations().front();
@@ -403,23 +458,23 @@ bool HloReplicationAnalysis::ComputeHloReplicationOnComputation(
             /*mark_everything_not_replicated=*/true);
       } else {
         for (int64_t i = 0; i < inst->operand_count(); ++i) {
-          changed |= propagate_shapetree(inst->operand(i),
-                                         called->parameter_instruction(i));
+          changed |= PropagateReplication(inst->operand(i),
+                                          called->parameter_instruction(i));
         }
         changed |= ComputeHloReplicationOnComputation(
             called, mark_everything_not_replicated);
       }
-      changed |= propagate_shapetree(called->root_instruction(), inst);
+      changed |= PropagateReplication(called->root_instruction(), inst);
     } else if (inst->opcode() == HloOpcode::kConditional) {
       // Propagate inputs' shape trees to the called computations' parameters.
       for (int64_t i = 0; i < inst->called_computations().size(); ++i) {
-        changed |= propagate_shapetree(
+        changed |= PropagateReplication(
             inst->operand(i + 1),
             inst->called_computations()[i]->parameter_instruction(0));
       }
       // If the condition is not replicated, the conditional result should be
       // different across replicas.
-      if (!hlo_replication_[inst->operand(0)]
+      if (!GetReplication(inst->operand(0))
                .element({})
                .IsReplicatedOnAllDevices()) {
         for (auto called : inst->called_computations()) {
@@ -427,36 +482,32 @@ bool HloReplicationAnalysis::ComputeHloReplicationOnComputation(
               called,
               /*mark_everything_not_replicated=*/true);
         }
-        changed |= assign_or_combine_shapetree(
-            ShapeTree<HloReplication>(inst->shape(),
-                                      HloReplication::UniqueOnAllDevices()),
-            inst);
+        changed |= MarkNotReplicated(inst);
       } else {
         for (auto called : inst->called_computations()) {
           changed |= ComputeHloReplicationOnComputation(
               called, mark_everything_not_replicated);
-          changed |= propagate_shapetree(called->root_instruction(), inst);
+          changed |= PropagateReplication(called->root_instruction(), inst);
         }
       }
     } else if (inst->opcode() == HloOpcode::kTuple) {
       ShapeTree<HloReplication> shape_tree(
-          inst->shape(), HloReplication::ReplicatedOnAllDevices());
+          &inst->shape(), HloReplication::ReplicatedOnAllDevices());
       for (int64_t i = 0; i < inst->operand_count(); ++i) {
-        shape_tree.CopySubtreeFrom(hlo_replication_[inst->operand(i)], {}, {i});
+        shape_tree.CopySubtreeFrom(GetReplication(inst->operand(i)), {}, {i});
       }
-      changed |= assign_or_combine_shapetree(std::move(shape_tree), inst);
+      changed |= AssignOrCombineReplication(std::move(shape_tree), inst);
     } else if (inst->opcode() == HloOpcode::kOptimizationBarrier) {
-      ShapeTree<HloReplication> shape_tree = hlo_replication_[inst->operand(0)];
-      changed |= assign_or_combine_shapetree(std::move(shape_tree), inst);
+      changed |= PropagateReplication(inst->operand(0), inst);
     } else if (inst->opcode() == HloOpcode::kGetTupleElement) {
       ShapeTree<HloReplication> shape_tree(
-          inst->shape(), HloReplication::ReplicatedOnAllDevices());
-      shape_tree.CopySubtreeFrom(hlo_replication_[inst->operand(0)],
+          &inst->shape(), HloReplication::ReplicatedOnAllDevices());
+      shape_tree.CopySubtreeFrom(GetReplication(inst->operand(0)),
                                  {inst->tuple_index()}, {});
-      changed |= assign_or_combine_shapetree(std::move(shape_tree), inst);
+      changed |= AssignOrCombineReplication(std::move(shape_tree), inst);
     } else if (inst->opcode() == HloOpcode::kInfeed && cross_partition_spmd_) {
       ShapeTree<HloReplication> shape_tree(
-          inst->shape(), HloReplication::UniqueOnAllDevices());
+          &inst->shape(), HloReplication::UniqueOnAllDevices());
       if (inst->has_sharding()) {
         auto sharding = inst->sharding().GetAsShapeTree(inst->shape());
         shape_tree.ForEachMutableElement(
@@ -466,23 +517,16 @@ bool HloReplicationAnalysis::ComputeHloReplicationOnComputation(
                           : HloReplication::UniqueOnAllDevices();
             });
       }
-      changed |= assign_or_combine_shapetree(std::move(shape_tree), inst);
+      changed |= AssignOrCombineReplication(std::move(shape_tree), inst);
+    } else if (mark_everything_not_replicated) {
+      changed |= MarkNotReplicated(inst);
     } else {
-      if (mark_everything_not_replicated) {
-        changed |= assign_or_combine_shapetree(
-            ShapeTree<HloReplication>(inst->shape(),
-                                      HloReplication::UniqueOnAllDevices()),
-            inst);
-      } else {
-        ShapeTree<HloReplication> shape_tree(
-            inst->shape(), HloReplication::ReplicatedOnAllDevices());
-        ShapeUtil::ForEachSubshape(
-            inst->shape(), [&](const Shape& subshape, const ShapeIndex& index) {
-              *shape_tree.mutable_element(index) =
-                  DetermineHloInstructionIsReplicated(inst, index);
-            });
-        changed |= assign_or_combine_shapetree(std::move(shape_tree), inst);
+      ShapeTree<HloReplication> shape_tree(
+          &inst->shape(), HloReplication::ReplicatedOnAllDevices());
+      for (ShapeTree<HloReplication>::Node& node : shape_tree) {
+        node.second = DetermineHloInstructionIsReplicated(inst, node.first);
       }
+      changed |= AssignOrCombineReplication(std::move(shape_tree), inst);
     }
   }
   return changed;
@@ -545,6 +589,9 @@ absl::Status HloReplicationAnalysis::ComputeHloReplication() {
   }
   ComputeHloReplicationOnComputation(entry,
                                      /*mark_everything_not_replicated=*/false);
+  // Scratch state of the walk.
+  post_orders_.clear();
+  computations_marked_not_replicated_.clear();
   return absl::OkStatus();
 }
 
@@ -671,25 +718,27 @@ HloReplicationAnalysis::HloReplication::HloReplication()
     : state_(State::kReplicatedOnAllDevices) {}
 
 HloReplicationAnalysis::HloReplication::HloReplication(
-    HloReplicationAnalysis::HloReplication::State state,
+    HloReplicationAnalysis::HloReplication::State state)
+    : state_(state) {
+  DCHECK(state != State::kPartiallyReplicated);
+}
+
+HloReplicationAnalysis::HloReplication::HloReplication(
     absl::Span<const std::vector<int64_t>> device_set_root_per_replica)
-    : state_(state),
+    : state_(State::kPartiallyReplicated),
       device_set_root_per_replica_(
           std::make_shared<
               HashOnConstruction<std::vector<std::vector<int64_t>>>>(
-              device_set_root_per_replica)) {
-  CHECK(state == State::kPartiallyReplicated ||
-        device_set_root_per_replica_->empty());
-}
+              device_set_root_per_replica)) {}
 
 HloReplicationAnalysis::HloReplication
 HloReplicationAnalysis::HloReplication::ReplicatedOnAllDevices() {
-  return HloReplication(State::kReplicatedOnAllDevices, {});
+  return HloReplication(State::kReplicatedOnAllDevices);
 }
 
 HloReplicationAnalysis::HloReplication
 HloReplicationAnalysis::HloReplication::UniqueOnAllDevices() {
-  return HloReplication(State::kUniqueOnAllDevices, {});
+  return HloReplication(State::kUniqueOnAllDevices);
 }
 
 HloReplicationAnalysis::HloReplication
@@ -716,8 +765,7 @@ HloReplicationAnalysis::HloReplication::PartiallyReplicated(
     }
     device_set_root_per_replica.push_back(std::move(device_set_root));
   }
-  return HloReplication(State::kPartiallyReplicated,
-                        device_set_root_per_replica);
+  return HloReplication(device_set_root_per_replica);
 }
 
 HloReplicationAnalysis::HloReplication
@@ -773,9 +821,14 @@ HloReplicationAnalysis::HloReplication::Merge(
 
 bool HloReplicationAnalysis::HloReplication::Equal(
     const HloReplication& other) const {
-  return state_ == other.state_ &&
-         device_set_root_per_replica_->hash_ ==
-             other.device_set_root_per_replica_->hash_;
+  if (state_ != other.state_) {
+    return false;
+  }
+  if (state_ != State::kPartiallyReplicated) {
+    return true;
+  }
+  return device_set_root_per_replica_->hash_ ==
+         other.device_set_root_per_replica_->hash_;
 }
 
 bool HloReplicationAnalysis::HloReplication::operator==(
@@ -791,9 +844,16 @@ bool HloReplicationAnalysis::HloReplication::IsUniqueOnAllDevices() const {
   return state_ == State::kUniqueOnAllDevices;
 }
 
+bool HloReplicationAnalysis::HloReplication::IsPartiallyReplicated() const {
+  return state_ == State::kPartiallyReplicated;
+}
+
 bool HloReplicationAnalysis::HloReplication::IsReplicatedWithinSubgroup(
     absl::Span<const int64_t> device_ids) const {
   if (device_ids.empty()) return true;
+  if (state_ != State::kPartiallyReplicated) {
+    return state_ == State::kReplicatedOnAllDevices;
+  }
   for (const std::vector<int64_t>& device_set_roots :
        *device_set_root_per_replica_) {
     if (!absl::c_all_of(device_ids,

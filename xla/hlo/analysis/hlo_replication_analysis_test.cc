@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <initializer_list>
 #include <memory>
 #include <string>
 #include <vector>
@@ -1047,6 +1048,158 @@ ENTRY entry {
       FindInstruction(module.get(), "gte.0"), {}));
   EXPECT_FALSE(analysis->HloInstructionIsReplicatedAt(
       FindInstruction(module.get(), "gte.1"), {}));
+}
+
+// Loop carried values that are partially replicated with two different
+// groupings, unique, and replicated, at their own tuple indices. The loop
+// needs a second iteration to settle: the partially replicated all-reduce
+// results only reach the parameter after the first pass over the body.
+TEST_F(HloReplicationAnalysisTest, WhileLoopPartialReplicationPerIndex) {
+  const std::string module_str = R"(
+HloModule WhileLoopPartialReplicationPerIndex
+
+sum {
+  a = f32[] parameter(0)
+  b = f32[] parameter(1)
+  ROOT add = f32[] add(a, b)
+}
+
+cond {
+  cond_param = (f32[8], f32[8], f32[8], u32[]) parameter(0)
+  i = u32[] get-tuple-element(cond_param), index=3
+  limit = u32[] constant(4)
+  ROOT lt = pred[] compare(i, limit), direction=LT
+}
+
+body {
+  body_param = (f32[8], f32[8], f32[8], u32[]) parameter(0)
+  x = f32[8] get-tuple-element(body_param), index=0
+  y = f32[8] get-tuple-element(body_param), index=1
+  u = f32[8] get-tuple-element(body_param), index=2
+  i = u32[] get-tuple-element(body_param), index=3
+  xu = f32[8] add(x, u)
+  yu = f32[8] add(y, u)
+  ar0 = f32[8] all-reduce(xu), to_apply=sum, replica_groups={{0,1},{2,3}}
+  ar1 = f32[8] all-reduce(yu), to_apply=sum, replica_groups={{0,2},{1,3}}
+  mixed = f32[8] add(ar0, ar1)
+  one = u32[] constant(1)
+  next_i = u32[] add(i, one)
+  ROOT tuple = (f32[8], f32[8], f32[8], u32[]) tuple(ar0, ar1, mixed, next_i)
+}
+
+ENTRY entry {
+  p0 = f32[8] parameter(0), parameter_replication={true}
+  p1 = f32[8] parameter(1), parameter_replication={true}
+  p2 = f32[8] parameter(2), parameter_replication={false}
+  zero = u32[] constant(0)
+  init = (f32[8], f32[8], f32[8], u32[]) tuple(p0, p1, p2, zero)
+  ROOT while = (f32[8], f32[8], f32[8], u32[]) while(init), condition=cond, body=body
+}
+)";
+  const std::vector<ReplicaGroup> pairs01_23 =
+      CreateReplicaGroups({{0, 1}, {2, 3}});
+  const std::vector<ReplicaGroup> pairs02_13 =
+      CreateReplicaGroups({{0, 2}, {1, 3}});
+
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(
+                                        module_str, /*replica_count=*/4));
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloReplicationAnalysis> analysis,
+                       HloReplicationAnalysis::RunWithPartialReplication(
+                           module.get(), /*cross_partition_spmd=*/false));
+
+  for (const char* name : {"while", "body_param", "tuple"}) {
+    const HloInstruction* inst = FindInstruction(module.get(), name);
+    EXPECT_FALSE(analysis->HloInstructionIsReplicatedAt(inst, {0})) << name;
+    EXPECT_TRUE(analysis->HloInstructionIsReplicatedAt(inst, {0}, pairs01_23))
+        << name;
+    EXPECT_FALSE(analysis->HloInstructionIsReplicatedAt(inst, {0}, pairs02_13))
+        << name;
+    EXPECT_FALSE(analysis->HloInstructionIsReplicatedAt(inst, {1})) << name;
+    EXPECT_FALSE(analysis->HloInstructionIsReplicatedAt(inst, {1}, pairs01_23))
+        << name;
+    EXPECT_TRUE(analysis->HloInstructionIsReplicatedAt(inst, {1}, pairs02_13))
+        << name;
+    EXPECT_FALSE(analysis->HloInstructionIsReplicatedAt(inst, {2})) << name;
+    EXPECT_FALSE(analysis->HloInstructionIsReplicatedAt(inst, {2}, pairs01_23))
+        << name;
+    EXPECT_FALSE(analysis->HloInstructionIsReplicatedAt(inst, {2}, pairs02_13))
+        << name;
+    EXPECT_TRUE(analysis->HloInstructionIsReplicatedAt(inst, {3})) << name;
+    EXPECT_TRUE(analysis->HloInstructionIsReplicatedAt(inst, {3}, pairs01_23))
+        << name;
+  }
+  // u is unique, so the all-reduce operands are unique in every pass and each
+  // all-reduce result is replicated within its own groups only.
+  EXPECT_FALSE(analysis->HloInstructionIsReplicatedAt(
+      FindInstruction(module.get(), "xu"), {}, pairs01_23));
+  EXPECT_FALSE(analysis->HloInstructionIsReplicatedAt(
+      FindInstruction(module.get(), "yu"), {}, pairs02_13));
+  EXPECT_TRUE(analysis->HloInstructionIsReplicatedAt(
+      FindInstruction(module.get(), "ar0"), {}, pairs01_23));
+  EXPECT_TRUE(analysis->HloInstructionIsReplicatedAt(
+      FindInstruction(module.get(), "ar1"), {}, pairs02_13));
+  EXPECT_FALSE(analysis->HloInstructionIsReplicatedAt(
+      FindInstruction(module.get(), "mixed"), {}, pairs01_23));
+  EXPECT_FALSE(analysis->HloInstructionIsReplicatedAt(
+      FindInstruction(module.get(), "mixed"), {}, pairs02_13));
+  EXPECT_TRUE(analysis->HloInstructionIsReplicatedAt(
+      FindInstruction(module.get(), "lt"), {}));
+}
+
+// The loop state enters through a tuple instruction, whose tree is replicated
+// at the tuple root as well as at the leaves. The condition turns
+// non replicated after the first pass, and the body parameter must then be
+// unique at every index, the tuple root included.
+TEST_F(HloReplicationAnalysisTest,
+       NonReplicatedConditionMarksBodyAtEveryIndex) {
+  const std::string module_str = R"(
+HloModule NonReplicatedConditionMarksBodyAtEveryIndex
+
+cond {
+  cond_param = (f32[8], u32[]) parameter(0)
+  i = u32[] get-tuple-element(cond_param), index=1
+  limit = u32[] constant(5)
+  ROOT lt = pred[] compare(i, limit), direction=LT
+}
+
+body {
+  body_param = (f32[8], u32[]) parameter(0)
+  x = f32[8] get-tuple-element(body_param), index=0
+  i = u32[] get-tuple-element(body_param), index=1
+  replica-id = u32[] replica-id()
+  next_i = u32[] add(i, replica-id)
+  ROOT tuple = (f32[8], u32[]) tuple(x, next_i)
+}
+
+ENTRY entry {
+  p0 = f32[8] parameter(0), parameter_replication={true}
+  zero = u32[] constant(0)
+  init = (f32[8], u32[]) tuple(p0, zero)
+  ROOT while = (f32[8], u32[]) while(init), condition=cond, body=body
+}
+)";
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(
+                                        module_str, /*replica_count=*/2));
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloReplicationAnalysis> analysis,
+                       HloReplicationAnalysis::Run(
+                           module.get(), /*cross_partition_spmd=*/false));
+  const HloInstruction* body_param =
+      FindInstruction(module.get(), "body_param");
+  EXPECT_FALSE(analysis->HloInstructionIsReplicatedAt(body_param, {}));
+  EXPECT_FALSE(analysis->HloInstructionIsReplicatedAt(body_param, {0}));
+  EXPECT_FALSE(analysis->HloInstructionIsReplicatedAt(body_param, {1}));
+  EXPECT_FALSE(analysis->HloInstructionIsReplicatedAt(
+      FindInstruction(module.get(), "x"), {}));
+  // The condition itself is not marked: its parameter keeps the replicated
+  // tuple root of the loop input.
+  EXPECT_TRUE(analysis->HloInstructionIsReplicatedAt(
+      FindInstruction(module.get(), "cond_param"), {}));
+  EXPECT_FALSE(analysis->HloInstructionIsReplicatedAt(
+      FindInstruction(module.get(), "cond_param"), {0}));
+  EXPECT_FALSE(analysis->HloInstructionIsReplicatedAt(
+      FindInstruction(module.get(), "while"), {0}));
+  EXPECT_FALSE(analysis->HloInstructionIsReplicatedAt(
+      FindInstruction(module.get(), "while"), {1}));
 }
 
 }  // namespace
