@@ -105,6 +105,9 @@ bool HasDisableWhileLoopDceAttr(const HloInstruction* instruction) {
                                     ->config()
                                     .debug_options()
                                     .xla_backend_extra_options();
+    if (extra_options.empty()) {
+      return false;
+    }
     for (const char* key :
          {kXlaDisableWhileLoopDce, "xla.disable_while_loop_dce",
           kXlaPreserveTupleIndices, "xla.preserve_tuple_indices"}) {
