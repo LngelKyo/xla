@@ -29,11 +29,13 @@ namespace gpu {
 HloPassPipeline FusionDispatchPipeline(
     const se::DeviceDescription& device_description,
     HloCostAnalysis::ShapeSizeFunction shape_size_fn,
-    mlir::MLIRContext* mlir_context) {
+    mlir::MLIRContext* mlir_context, tsl::thread::ThreadPool* thread_pool,
+    MlirContextPool* mlir_context_pool) {
   HloPassPipeline pipeline("fusion-dispatch-pipeline");
   pipeline.AddPass<HloDCE>();
   pipeline.AddPass<FusionBlockLevelRewriter>(device_description, shape_size_fn,
-                                             mlir_context);
+                                             mlir_context, thread_pool,
+                                             mlir_context_pool);
   return pipeline;
 }
 
